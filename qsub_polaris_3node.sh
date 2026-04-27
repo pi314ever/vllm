@@ -32,7 +32,7 @@
 
 #PBS -l select=3:system=polaris:ncpus=32:ngpus=4
 #PBS -l walltime=01:00:00
-#PBS -l filesystems=home,grand
+#PBS -l filesystems=home:grand
 #PBS -q debug-scaling
 #PBS -A Intel
 #PBS -N vllm-deepseek-r1-bench
