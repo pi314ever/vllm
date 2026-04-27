@@ -45,6 +45,49 @@ set -euo pipefail
 cd "${PBS_O_WORKDIR:-$(pwd)}"
 
 # =============================================================================
+# PYTHON ENVIRONMENT SETUP
+# =============================================================================
+# Ensure uv is available, create a venv if needed, and install vllm (+ ray).
+
+VENV_DIR="${VENV_DIR:-${PBS_O_WORKDIR:-.}/.venv}"
+
+# Ensure uv is on PATH (install if missing)
+if ! command -v uv &>/dev/null; then
+	echo "Installing uv..."
+	curl -LsSf https://astral.sh/uv/install.sh | sh
+	export PATH="${HOME}/.local/bin:${PATH}"
+fi
+
+# Create the venv if it doesn't exist
+if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
+	echo "Creating virtual environment at ${VENV_DIR}..."
+	uv venv --python 3.12 "${VENV_DIR}"
+fi
+
+# Activate the venv
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+echo "Activated venv: ${VENV_DIR}"
+
+# Install vllm (pulls in ray and other dependencies) if not already installed
+if ! python -c "import vllm" &>/dev/null; then
+	echo "Installing vllm (this may take a few minutes)..."
+	VLLM_USE_PRECOMPILED=1 uv pip install vllm --torch-backend=auto
+fi
+
+# Verify ray and vllm are available
+if ! command -v ray &>/dev/null; then
+	echo "ERROR: 'ray' not found after installation. Check your environment."
+	exit 1
+fi
+if ! command -v vllm &>/dev/null; then
+	echo "ERROR: 'vllm' CLI not found after installation. Check your environment."
+	exit 1
+fi
+
+echo "Environment ready: $(python --version), ray $(ray --version 2>/dev/null || echo 'unknown'), vllm $(vllm --version 2>/dev/null || echo 'unknown')"
+
+# =============================================================================
 # USER CONFIGURATION
 # =============================================================================
 
@@ -178,7 +221,7 @@ cleanup() {
 
 	for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
 		echo "  Stopping Ray on ${WHOST}..."
-		ssh "${WHOST}" "ray stop --force" 2>/dev/null || true
+		ssh "${WHOST}" "source '${VENV_DIR}/bin/activate' && ray stop --force" 2>/dev/null || true
 	done
 
 	# Kill background SSH sessions
@@ -234,6 +277,9 @@ launch_worker() {
 		export VLLM_HOST_IP="${worker_ip}"
 		export RAY_USAGE_STATS_ENABLED=0
 
+		# Activate the venv so ray is available on the worker node
+		source "${VENV_DIR}/bin/activate"
+
 		echo "[${worker_label}] Stopping any existing Ray processes..."
 		ray stop --force 2>/dev/null || true
 		sleep 2
@@ -284,7 +330,7 @@ POLL_INTERVAL=5
 ELAPSED=0
 
 while true; do
-	ACTIVE_NODES=$(python3 -c "
+	ACTIVE_NODES=$(python -c "
 import ray
 ray.init(address='auto', ignore_reinit_error=True)
 nodes = ray.nodes()
