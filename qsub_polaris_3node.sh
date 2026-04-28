@@ -76,6 +76,15 @@ fi
 source "${VENV_DIR}/bin/activate"
 echo "Activated venv: ${VENV_DIR}"
 
+# Add pip-installed NVIDIA CUDA runtime libraries to LD_LIBRARY_PATH
+# (pip packages like nvidia-cuda-runtime-cu12 bundle libcudart.so but don't
+# add their lib dirs to LD_LIBRARY_PATH automatically)
+CUDA_RT_LIB="$(python -c "import nvidia.cuda_runtime, os; print(os.path.dirname(nvidia.cuda_runtime.__file__) + '/lib')" 2>/dev/null || true)"
+if [[ -n "${CUDA_RT_LIB}" && -d "${CUDA_RT_LIB}" ]]; then
+	export LD_LIBRARY_PATH="${CUDA_RT_LIB}:${LD_LIBRARY_PATH:-}"
+	echo "Added NVIDIA CUDA runtime to LD_LIBRARY_PATH: ${CUDA_RT_LIB}"
+fi
+
 # Install vllm (pulls in ray and other dependencies) if not already installed
 if ! python -c "import vllm" &>/dev/null; then
 	echo "Installing vllm (this may take a few minutes)..."
@@ -311,6 +320,12 @@ launch_worker() {
 
 		# Activate the venv so ray is available on the worker node
 		source '${VENV_DIR}/bin/activate'
+
+		# Add pip-installed NVIDIA CUDA runtime libraries to LD_LIBRARY_PATH
+		CUDA_RT_LIB=\$(python -c \"import nvidia.cuda_runtime, os; print(os.path.dirname(nvidia.cuda_runtime.__file__) + '/lib')\" 2>/dev/null || true)
+		if [[ -n \"\${CUDA_RT_LIB}\" && -d \"\${CUDA_RT_LIB}\" ]]; then
+			export LD_LIBRARY_PATH=\"\${CUDA_RT_LIB}:\${LD_LIBRARY_PATH:-}\"
+		fi
 
 		echo '[${worker_label}] Stopping any existing Ray processes...'
 		ray stop --force 2>/dev/null || true
