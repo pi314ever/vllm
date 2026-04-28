@@ -48,6 +48,9 @@ export ftp_proxy="http://proxy.alcf.anl.gov:3128"
 # Change to the directory from which qsub was invoked
 cd "${PBS_O_WORKDIR:-$(pwd)}"
 
+# Load CUDA runtime libraries (required for libcudart.so on compute nodes)
+module load cuda/12.9
+
 # =============================================================================
 # PYTHON ENVIRONMENT SETUP
 # =============================================================================
@@ -302,6 +305,9 @@ launch_worker() {
 		export RAY_USAGE_STATS_ENABLED=0
 		export RAY_TMPDIR='${RAY_TMPDIR}'
 		mkdir -p '${RAY_TMPDIR}'
+
+		# Load CUDA runtime libraries
+		module load cuda/12.9
 
 		# Activate the venv so ray is available on the worker node
 		source '${VENV_DIR}/bin/activate'
