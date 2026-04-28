@@ -112,6 +112,14 @@ EXPECTED_NODES=3
 EXPECTED_GPUS=12                                  # 3 nodes * 4 GPUs
 RAY_CLUSTER_TIMEOUT="${RAY_CLUSTER_TIMEOUT:-600}" # seconds
 
+# Use a short temp dir to avoid AF_UNIX 107-byte socket path limit.
+# PBS on Polaris sets $TMPDIR to very long paths like:
+#   /var/tmp/pbs.7101514.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov/
+# which causes Ray socket paths to exceed the OS limit.
+RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${PBS_JOBID%%.*}}"
+export RAY_TMPDIR
+mkdir -p "${RAY_TMPDIR}"
+
 # GPU visibility (4 GPUs per node on Polaris)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
@@ -232,6 +240,15 @@ cleanup() {
 		fi
 	done
 
+	# Clean up the Ray temp directory on all nodes
+	if [[ -n "${RAY_TMPDIR:-}" ]]; then
+		echo "  Removing Ray temp dir ${RAY_TMPDIR}..."
+		rm -rf "${RAY_TMPDIR}" 2>/dev/null || true
+		for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
+			ssh "${WHOST}" "rm -rf '${RAY_TMPDIR}'" 2>/dev/null || true
+		done
+	fi
+
 	echo "Cleanup complete."
 }
 
@@ -252,6 +269,7 @@ sleep 2
 ray start --head \
 	--port="${RAY_PORT}" \
 	--num-gpus="${TP_SIZE}" \
+	--temp-dir="${RAY_TMPDIR}" \
 	--dashboard-host=0.0.0.0
 
 echo "Ray head started. Dashboard: http://${HEAD_IP}:8265"
@@ -276,6 +294,8 @@ launch_worker() {
 		export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
 		export VLLM_HOST_IP="${worker_ip}"
 		export RAY_USAGE_STATS_ENABLED=0
+		export RAY_TMPDIR="${RAY_TMPDIR}"
+		mkdir -p "${RAY_TMPDIR}"
 
 		# Activate the venv so ray is available on the worker node
 		source "${VENV_DIR}/bin/activate"
@@ -293,6 +313,7 @@ launch_worker() {
 			if ray start \
 				--address="${HEAD_IP}:${RAY_PORT}" \
 				--num-gpus=${TP_SIZE} \
+				--temp-dir="${RAY_TMPDIR}" \
 				--block; then
 				echo "[${worker_label}] Disconnected from cluster."
 				exit 0
