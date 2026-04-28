@@ -8,7 +8,7 @@
 #
 # Single qsub-submittable script that orchestrates the full 3-node benchmark:
 #   1. Discovers allocated nodes from PBS_NODEFILE
-#   2. Launches Ray head on node 0, Ray workers on nodes 1 & 2 (via SSH)
+#   2. Launches Ray head on node 0, Ray workers on nodes 1 & 2 (via mpiexec)
 #   3. Runs offline latency benchmarks (vllm bench latency)
 #   4. Starts vLLM API server and runs online serving benchmarks
 #   5. Cleans up Ray on all nodes on exit
@@ -233,10 +233,11 @@ cleanup() {
 
 	for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
 		echo "  Stopping Ray on ${WHOST}..."
-		ssh "${WHOST}" "source '${VENV_DIR}/bin/activate' && ray stop --force" 2>/dev/null || true
+		mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
+			"source '${VENV_DIR}/bin/activate' && ray stop --force" 2>/dev/null || true
 	done
 
-	# Kill background SSH sessions
+	# Kill background mpiexec worker sessions
 	for WPID in "${WORKER1_PID}" "${WORKER2_PID}"; do
 		if [[ -n "${WPID}" ]]; then
 			kill "${WPID}" 2>/dev/null || true
@@ -249,7 +250,8 @@ cleanup() {
 		echo "  Removing Ray temp dir ${RAY_TMPDIR}..."
 		rm -rf "${RAY_TMPDIR}" 2>/dev/null || true
 		for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
-			ssh "${WHOST}" "rm -rf '${RAY_TMPDIR}'" 2>/dev/null || true
+			mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
+				"rm -rf '${RAY_TMPDIR}'" 2>/dev/null || true
 		done
 	fi
 
@@ -279,60 +281,60 @@ ray start --head \
 echo "Ray head started. Dashboard: http://${HEAD_IP}:8265"
 
 # =============================================================================
-# STEP 2: Start Ray Workers on Nodes 1 & 2 (via SSH)
+# STEP 2: Start Ray Workers on Nodes 1 & 2 (via mpiexec)
 # =============================================================================
 
 echo ""
 echo "[Step 2/5] Starting Ray workers on ${WORKER1_HOST} and ${WORKER2_HOST}..."
 
-# Helper: launch a Ray worker on a remote node via SSH.
-# The worker runs with --block so the SSH session stays alive until Ray stops.
+# Helper: launch a Ray worker on a remote node via mpiexec.
+# The worker runs with --block so the mpiexec session stays alive until Ray stops.
 launch_worker() {
 	local worker_host="$1"
 	local worker_ip="$2"
 	local worker_label="$3"
 
-	ssh "${worker_host}" bash -l <<-WORKER_EOF
+	mpiexec -n 1 --ppn 1 --hosts "${worker_host}" -- bash -c "
 		set -euo pipefail
 
-		export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
-		export VLLM_HOST_IP="${worker_ip}"
+		export CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}'
+		export VLLM_HOST_IP='${worker_ip}'
 		export RAY_USAGE_STATS_ENABLED=0
-		export RAY_TMPDIR="${RAY_TMPDIR}"
-		mkdir -p "${RAY_TMPDIR}"
+		export RAY_TMPDIR='${RAY_TMPDIR}'
+		mkdir -p '${RAY_TMPDIR}'
 
 		# Activate the venv so ray is available on the worker node
-		source "${VENV_DIR}/bin/activate"
+		source '${VENV_DIR}/bin/activate'
 
-		echo "[${worker_label}] Stopping any existing Ray processes..."
+		echo '[${worker_label}] Stopping any existing Ray processes...'
 		ray stop --force 2>/dev/null || true
 		sleep 2
 
-		echo "[${worker_label}] Joining Ray cluster at ${HEAD_IP}:${RAY_PORT}..."
+		echo '[${worker_label}] Joining Ray cluster at ${HEAD_IP}:${RAY_PORT}...'
 		ELAPSED=0
 		RETRY_INTERVAL=5
 		JOIN_TIMEOUT=300
 
 		while true; do
-			if ray start \
-				--address="${HEAD_IP}:${RAY_PORT}" \
-				--num-gpus=${TP_SIZE} \
-				--temp-dir="${RAY_TMPDIR}" \
+			if ray start \\
+				--address='${HEAD_IP}:${RAY_PORT}' \\
+				--num-gpus=${TP_SIZE} \\
+				--temp-dir='${RAY_TMPDIR}' \\
 				--block; then
-				echo "[${worker_label}] Disconnected from cluster."
+				echo '[${worker_label}] Disconnected from cluster.'
 				exit 0
 			fi
 
 			ELAPSED=\$((ELAPSED + RETRY_INTERVAL))
-			if [[ "\${ELAPSED}" -ge "\${JOIN_TIMEOUT}" ]]; then
-				echo "[${worker_label}] ERROR: Timed out joining cluster after \${JOIN_TIMEOUT}s."
+			if [[ \"\${ELAPSED}\" -ge \"\${JOIN_TIMEOUT}\" ]]; then
+				echo '[${worker_label}] ERROR: Timed out joining cluster after \${JOIN_TIMEOUT}s.'
 				exit 1
 			fi
 
-			echo "[${worker_label}] Retrying in \${RETRY_INTERVAL}s... (\${ELAPSED}s elapsed)"
-			sleep "\${RETRY_INTERVAL}"
+			echo '[${worker_label}] Retrying in \${RETRY_INTERVAL}s... (\${ELAPSED}s elapsed)'
+			sleep \"\${RETRY_INTERVAL}\"
 		done
-	WORKER_EOF
+	"
 }
 
 # Launch workers in background
@@ -342,7 +344,7 @@ WORKER1_PID=$!
 launch_worker "${WORKER2_HOST}" "${WORKER2_IP}" "Worker2" &
 WORKER2_PID=$!
 
-echo "Worker SSH sessions launched (PIDs: ${WORKER1_PID}, ${WORKER2_PID})"
+echo "Worker mpiexec sessions launched (PIDs: ${WORKER1_PID}, ${WORKER2_PID})"
 
 # =============================================================================
 # STEP 3: Wait for All Nodes to Join the Cluster
