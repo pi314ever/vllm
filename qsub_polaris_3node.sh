@@ -41,6 +41,10 @@
 
 set -euo pipefail
 
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+
 # Change to the directory from which qsub was invoked
 cd "${PBS_O_WORKDIR:-$(pwd)}"
 
@@ -93,7 +97,7 @@ echo "Environment ready: $(python --version), ray $(ray --version 2>/dev/null ||
 
 # Model configuration
 MODEL="${MODEL:-/grand/Intel/dhuang/Deepseek-V3-0324}"
-QUANTIZATION="${QUANTIZATION:-}"  # e.g. "fp8"; leave empty for no quantization
+QUANTIZATION="${QUANTIZATION:-}" # e.g. "fp8"; leave empty for no quantization
 DTYPE="${DTYPE:-auto}"
 
 # Build conditional quantization args (used by ENGINE_ARGS and vllm serve)
