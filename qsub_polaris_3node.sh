@@ -45,9 +45,6 @@ export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"
 export ftp_proxy="http://proxy.alcf.anl.gov:3128"
 
-# Change to the directory from which qsub was invoked
-cd "${PBS_O_WORKDIR:-$(pwd)}"
-
 # Load CUDA runtime libraries (required for libcudart.so on compute nodes)
 module load cuda/12.9
 
@@ -75,31 +72,6 @@ fi
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 echo "Activated venv: ${VENV_DIR}"
-
-# Add pip-installed NVIDIA CUDA runtime libraries to LD_LIBRARY_PATH
-# (pip packages like nvidia-cuda-runtime-cu12 bundle libcudart.so but don't
-# add their lib dirs to LD_LIBRARY_PATH automatically)
-CUDA_RT_LIB="$(python -c "import nvidia.cuda_runtime, os; print(os.path.dirname(nvidia.cuda_runtime.__file__) + '/lib')" 2>/dev/null || true)"
-if [[ -n "${CUDA_RT_LIB}" && -d "${CUDA_RT_LIB}" ]]; then
-	export LD_LIBRARY_PATH="${CUDA_RT_LIB}:${LD_LIBRARY_PATH:-}"
-	echo "Added NVIDIA CUDA runtime to LD_LIBRARY_PATH: ${CUDA_RT_LIB}"
-fi
-
-# Install vllm (pulls in ray and other dependencies) if not already installed
-if ! python -c "import vllm" &>/dev/null; then
-	echo "Installing vllm (this may take a few minutes)..."
-	VLLM_USE_PRECOMPILED=1 uv pip install vllm --torch-backend=auto
-fi
-
-# Verify ray and vllm are available
-if ! command -v ray &>/dev/null; then
-	echo "ERROR: 'ray' not found after installation. Check your environment."
-	exit 1
-fi
-if ! command -v vllm &>/dev/null; then
-	echo "ERROR: 'vllm' CLI not found after installation. Check your environment."
-	exit 1
-fi
 
 echo "Environment ready: $(python --version), ray $(ray --version 2>/dev/null || echo 'unknown'), vllm $(vllm --version 2>/dev/null || echo 'unknown')"
 
@@ -320,12 +292,6 @@ launch_worker() {
 
 		# Activate the venv so ray is available on the worker node
 		source '${VENV_DIR}/bin/activate'
-
-		# Add pip-installed NVIDIA CUDA runtime libraries to LD_LIBRARY_PATH
-		CUDA_RT_LIB=\$(python -c \"import nvidia.cuda_runtime, os; print(os.path.dirname(nvidia.cuda_runtime.__file__) + '/lib')\" 2>/dev/null || true)
-		if [[ -n \"\${CUDA_RT_LIB}\" && -d \"\${CUDA_RT_LIB}\" ]]; then
-			export LD_LIBRARY_PATH=\"\${CUDA_RT_LIB}:\${LD_LIBRARY_PATH:-}\"
-		fi
 
 		echo '[${worker_label}] Stopping any existing Ray processes...'
 		ray stop --force 2>/dev/null || true
