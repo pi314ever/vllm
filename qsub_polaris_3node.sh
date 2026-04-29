@@ -80,7 +80,7 @@ echo "Environment ready: $(python --version), ray $(ray --version 2>/dev/null ||
 # =============================================================================
 
 # Model configuration
-MODEL="${MODEL:-/grand/Intel/dhuang/Deepseek-V3-0324}"
+MODEL="${MODEL:-/grand/Intel/dhuang/Deepseek-V3-0324/}"
 QUANTIZATION="${QUANTIZATION:-}" # e.g. "fp8"; leave empty for no quantization
 DTYPE="${DTYPE:-auto}"
 
