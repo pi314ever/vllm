@@ -429,7 +429,6 @@ ENGINE_ARGS=(
 	--distributed-executor-backend ray
 	--max-model-len "${MAX_MODEL_LEN}"
 	--trust-remote-code
-	--disable-log-requests
 )
 
 BATCH_SIZES=(1 2 4 8 16 32)
@@ -478,7 +477,6 @@ vllm serve "${MODEL}" \
 	--distributed-executor-backend ray \
 	--max-model-len "${MAX_MODEL_LEN}" \
 	--trust-remote-code \
-	--disable-log-requests \
 	--host 0.0.0.0 \
 	--port "${SERVE_PORT}" \
 	>"${RESULTS_DIR}/server.log" 2>&1 &
