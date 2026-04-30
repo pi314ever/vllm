@@ -243,6 +243,38 @@ else:
 PY
 
 # =============================================================================
+# PERSISTENT COMPILE CACHES (Triton / Inductor / vLLM)
+# =============================================================================
+# First-run JIT compilation is the main source of process pressure during
+# the initial decode step (each of the 4 workers per node shells out to
+# /usr/bin/gcc to build the Triton launcher stub). On a cold cache, 4
+# concurrent gcc invocations per node can trip `vfork: Resource
+# temporarily unavailable` from Triton's `_build`, crashing the first
+# kernel launch in `_compute_slot_mapping_kernel` (see worker_base.py ->
+# gpu_model_runner.py -> block_table.compute_slot_mapping).
+#
+# Parking these caches on a shared, persistent filesystem means SECOND
+# and later jobs hit the cache and skip gcc entirely. /grand is Polaris's
+# project filesystem and is readable/writable from every compute node.
+#
+# Hardcoded to /grand/Intel/dhuang because this script is expected to be
+# used by dhuang. Change if another user adopts it.
+CACHE_ROOT="/grand/Intel/dhuang/vllm_polaris_cache"
+export TRITON_CACHE_DIR="${CACHE_ROOT}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/inductor"
+export VLLM_CACHE_ROOT="${CACHE_ROOT}/vllm"
+
+mkdir -p "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${VLLM_CACHE_ROOT}"
+
+# Serialize concurrent compilation through Triton's file-lock cache
+# manager. With 4 workers per node all JIT-compiling the same kernel
+# simultaneously, concurrent gcc invocations can transiently spike the
+# per-user/per-cgroup process count even with a shared cache.
+# FileCacheManager takes a per-cache-key flock so only one rank actually
+# runs gcc; the other ranks block until the .so lands, then mmap it.
+export TRITON_CACHE_MANAGER="${TRITON_CACHE_MANAGER:-triton.runtime.cache:FileCacheManager}"
+
+# =============================================================================
 # USER CONFIGURATION
 # =============================================================================
 
@@ -486,6 +518,7 @@ echo "  EP size:        ${EP_SIZE} (derived: TP * DP, DP=1)"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
 echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
+echo "  Cache root:     ${CACHE_ROOT}"
 echo "  Results dir:    ${RESULTS_DIR}"
 echo "============================================="
 
@@ -598,6 +631,14 @@ launch_worker() {
 		export RAY_USAGE_STATS_ENABLED=0
 		export RAY_TMPDIR='${RAY_TMPDIR}'
 		mkdir -p '${RAY_TMPDIR}'
+
+		# Persistent compile caches (shared filesystem, must match head
+		# node so FileCacheManager's per-key flock actually serializes
+		# across all ranks in the cluster).
+		export TRITON_CACHE_DIR='${TRITON_CACHE_DIR}'
+		export TORCHINDUCTOR_CACHE_DIR='${TORCHINDUCTOR_CACHE_DIR}'
+		export VLLM_CACHE_ROOT='${VLLM_CACHE_ROOT}'
+		export TRITON_CACHE_MANAGER='${TRITON_CACHE_MANAGER}'
 
 		# Ray executor backend: keep workers in sync with the head-node env so
 		# any worker-side code that re-reads VLLM_USE_RAY_V2_EXECUTOR_BACKEND
