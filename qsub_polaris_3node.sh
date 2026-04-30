@@ -130,9 +130,9 @@ NUM_WARMUPS="${NUM_WARMUPS:-10}"
 # Polaris uses HPE Slingshot interconnect. The high-speed network interfaces
 # are typically named hsn0, hsn1, etc. Uncomment and adjust if needed.
 #
-# export NCCL_SOCKET_IFNAME=hsn0
-# export GLOO_SOCKET_IFNAME=hsn0
-# export NCCL_DEBUG=WARN
+export NCCL_SOCKET_IFNAME=hsn0
+export GLOO_SOCKET_IFNAME=hsn0
+export NCCL_DEBUG=WARN
 
 # Disable Ray usage stats
 export RAY_USAGE_STATS_ENABLED=0
@@ -263,6 +263,17 @@ ray start --head \
 	--dashboard-host=0.0.0.0
 
 echo "Ray head started. Dashboard: http://${HEAD_IP}:8265"
+
+# Tell vLLM drivers and every subprocess they spawn to ATTACH to this Ray
+# cluster rather than fall through to ray.init(address=None) and start a
+# brand-new local Ray instance. The CUDA branch of
+# vllm/v1/executor/ray_utils.py:initialize_ray_cluster calls
+# `ray.init(address=ray_address)` with ray_address=None, which (unlike the
+# ROCm/XPU branch that uses address='auto') does NOT auto-discover an
+# existing local cluster. Without RAY_ADDRESS, EngineCore logs
+# "Started a local Ray instance." and only sees the 4 head-node GPUs.
+export RAY_ADDRESS="${HEAD_IP}:${RAY_PORT}"
+echo "Exported RAY_ADDRESS=${RAY_ADDRESS} for vLLM subprocesses."
 
 # =============================================================================
 # STEP 2: Start Ray Workers on Nodes 1 & 2 (via mpiexec)
