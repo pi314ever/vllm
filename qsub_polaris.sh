@@ -14,8 +14,8 @@
 #   5. Cleans up Ray on all nodes on exit
 #
 # Parallelism model (defaults):
-#   NUM_NODES=4, GPUS_PER_NODE=4  -> 16 GPUs total
-#   PP_SIZE=4, TP_SIZE=4          -> PP across nodes, TP within each node
+#   NUM_NODES=6, GPUS_PER_NODE=4  -> 24 GPUs total
+#   PP_SIZE=6, TP_SIZE=4          -> PP across nodes, TP within each node
 #   --enable-expert-parallel      -> EP size = TP_SIZE * DP_SIZE = 4 (DP=1)
 #
 # NOTE on EP: vLLM exposes expert parallelism as a boolean flag
@@ -34,8 +34,8 @@
 #   # Override settings at submission time (note: the PBS `select=` directive
 #   # is baked into the file, so if you change NUM_NODES you must either edit
 #   # the -l select=... line below OR override it on the qsub command line):
-#   qsub -l select=6:system=polaris:ncpus=32:ngpus=4 \
-#        -v NUM_NODES=6,PP_SIZE=6,TP_SIZE=4 qsub_polaris.sh
+#   qsub -l select=4:system=polaris:ncpus=32:ngpus=4 \
+#        -v NUM_NODES=4,PP_SIZE=4,TP_SIZE=4 qsub_polaris.sh
 #
 # =============================================================================
 
@@ -45,7 +45,7 @@
 # NOTE: The `select=N` count here MUST match NUM_NODES in the user config
 # section below, or be overridden at submission time with `qsub -l select=...`.
 
-#PBS -l select=4:system=polaris:ncpus=32:ngpus=4
+#PBS -l select=6:system=polaris:ncpus=32:ngpus=4
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:grand
 #PBS -q debug-scaling
@@ -280,7 +280,7 @@ export TRITON_CACHE_MANAGER="${TRITON_CACHE_MANAGER:-triton.runtime.cache:FileCa
 
 # Model configuration
 MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
-QUANTIZATION="${QUANTIZATION:-}" # e.g. "fp8"; leave empty for no quantization
+QUANTIZATION="${QUANTIZATION:-fp8}" # e.g. "fp8"; set to empty for no quantization
 DTYPE="${DTYPE:-auto}"
 
 # Build conditional quantization args (used by ENGINE_ARGS and vllm serve)
@@ -300,10 +300,10 @@ fi
 #                 With --enable-expert-parallel and DP=1, EP_SIZE == TP_SIZE.
 #
 # Invariant: PP_SIZE * TP_SIZE == NUM_NODES * GPUS_PER_NODE
-NUM_NODES="${NUM_NODES:-4}"
+NUM_NODES="${NUM_NODES:-6}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 TP_SIZE="${TP_SIZE:-4}"
-PP_SIZE="${PP_SIZE:-4}"
+PP_SIZE="${PP_SIZE:-6}"
 
 # Ray configuration
 RAY_PORT="${RAY_PORT:-6379}"
