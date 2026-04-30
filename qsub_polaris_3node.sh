@@ -145,6 +145,37 @@ export NCCL_DEBUG=WARN
 export RAY_USAGE_STATS_ENABLED=0
 
 # =============================================================================
+# THREAD LIMITS
+# =============================================================================
+# Polaris compute nodes have 32 physical CPU cores per node. With TP=4 GPUs
+# per node, Ray spawns 4 worker processes plus several helper/driver/actor
+# processes per node. If each process lets OpenBLAS/OMP/MKL default to the
+# full core count (32), total thread creation quickly exceeds RLIMIT_NPROC
+# and you see errors like:
+#
+#   OpenBLAS blas_thread_init: pthread_create failed for thread 26 of 32:
+#     Resource temporarily unavailable
+#   OpenBLAS blas_thread_init: RLIMIT_NPROC 2060880 current, 2060880 max
+#
+# which fail the Ray actor import and cascade into a placement-group hang.
+#
+# Cap BLAS/OMP threads to a sane per-worker budget. 32 cores / 4 workers = 8
+# threads per worker, but we pick a conservative default of 4 to leave
+# headroom for driver/actor processes, tokenizers' rayon pool, and torch's
+# internal threadpools.
+NUM_THREADS_PER_WORKER="${NUM_THREADS_PER_WORKER:-4}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+# HuggingFace tokenizers uses Rayon; cap its pool too.
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+# Match PyTorch's intra-op / inter-op pools.
+export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
+
+# =============================================================================
 # NODE DISCOVERY FROM PBS
 # =============================================================================
 
@@ -238,6 +269,7 @@ echo "  PP size:        ${PP_SIZE}"
 echo "  EP:             enabled"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
+echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
 echo "  Results dir:    ${RESULTS_DIR}"
 echo "============================================="
 
@@ -351,6 +383,20 @@ launch_worker() {
 		export RAY_USAGE_STATS_ENABLED=0
 		export RAY_TMPDIR='${RAY_TMPDIR}'
 		mkdir -p '${RAY_TMPDIR}'
+
+		# Thread limits (must match head node; see RLIMIT_NPROC note above).
+		export OMP_NUM_THREADS='${OMP_NUM_THREADS}'
+		export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS}'
+		export MKL_NUM_THREADS='${MKL_NUM_THREADS}'
+		export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS}'
+		export VECLIB_MAXIMUM_THREADS='${VECLIB_MAXIMUM_THREADS}'
+		export RAYON_NUM_THREADS='${RAYON_NUM_THREADS}'
+		export TORCH_NUM_THREADS='${TORCH_NUM_THREADS}'
+
+		# NCCL/Gloo must use the same interface as on the head node.
+		export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
+		export GLOO_SOCKET_IFNAME='${RAY_IFNAME}'
+		export NCCL_DEBUG='${NCCL_DEBUG}'
 
 		# Load CUDA runtime libraries
 		module load cuda/12.9
