@@ -91,6 +91,73 @@ echo "Activated venv: ${VENV_DIR}"
 echo "Environment ready: $(python --version), ray $(ray --version 2>/dev/null || echo 'unknown'), vllm $(vllm --version 2>/dev/null || echo 'unknown')"
 
 # =============================================================================
+# STEP 0: Patch vLLM for PP>1 Ray KeyError (vllm-project/vllm#41287)
+# =============================================================================
+# vllm==0.20.0 has a bug where RayDistributedExecutor reorders workers and
+# calls WorkerWrapperBase.adjust_rank, but adjust_rank only updates rpc_rank
+# and not global_rank. That desync causes each worker to pick the wrong
+# entry from the per-worker kv_cache_configs list, and PP>1 jobs crash with
+# e.g. `KeyError: 'model.layers.30.self_attn.attn'` during
+# initialize_attn_backend. See:
+#   - Issue: https://github.com/vllm-project/vllm/issues/41287
+#   - Fix PR (not yet merged): https://github.com/vllm-project/vllm/pull/41298
+#
+# The patch below is PR #41298's one-liner: also assign self.global_rank.
+# It is idempotent (skips if already patched or if upstream has fixed it) and
+# aborts the job if it cannot recognize the source shape.
+#
+# DELETE this block once your installed vLLM version contains PR #41298.
+
+python - <<'PY' || { echo "ERROR: vLLM adjust_rank patch failed. Aborting."; exit 1; }
+import sys, pathlib, shutil, tempfile, inspect
+import vllm.v1.worker.worker_base as m
+src_path = pathlib.Path(inspect.getsourcefile(m))
+src = src_path.read_text()
+
+ORIGINAL = (
+    "    def adjust_rank(self, rank_mapping: dict[int, int]) -> None:\n"
+    "        if self.rpc_rank in rank_mapping:\n"
+    "            self.rpc_rank = rank_mapping[self.rpc_rank]\n"
+)
+PATCHED = (
+    "    def adjust_rank(self, rank_mapping: dict[int, int]) -> None:\n"
+    "        if self.rpc_rank in rank_mapping:\n"
+    "            self.rpc_rank = rank_mapping[self.rpc_rank]\n"
+    "            self.global_rank = self.rpc_rank\n"
+)
+
+if PATCHED in src:
+    print(f"[vllm-patch] already patched: {src_path}")
+    sys.exit(0)
+if ORIGINAL not in src:
+    # Accept any source where the fix line is already present as "fixed upstream".
+    if "self.global_rank = self.rpc_rank" in inspect.getsource(m.WorkerWrapperBase.adjust_rank):
+        print(f"[vllm-patch] upstream fix detected, skipping: {src_path}")
+        sys.exit(0)
+    print(f"[vllm-patch] ERROR: adjust_rank source shape not recognized in {src_path}.", file=sys.stderr)
+    print("[vllm-patch] Refusing to run the benchmark; it would crash during profiling.", file=sys.stderr)
+    print("[vllm-patch] Inspect the file manually and update this patch block.", file=sys.stderr)
+    sys.exit(1)
+
+new_src = src.replace(ORIGINAL, PATCHED, 1)
+# Atomic replace via a sibling temp file so readers never see a partial file.
+with tempfile.NamedTemporaryFile("w", dir=str(src_path.parent), delete=False) as tmp:
+    tmp.write(new_src)
+    tmp_path = pathlib.Path(tmp.name)
+shutil.copymode(src_path, tmp_path)
+tmp_path.replace(src_path)
+print(f"[vllm-patch] patch applied: {src_path}")
+PY
+
+# Post-patch sanity check: ensure the fix line is actually present in the
+# module we will import at runtime. Guards against import-caching oddities
+# and anything else that could silently leave the file unpatched.
+python -c "import inspect, vllm.v1.worker.worker_base as m; \
+assert 'self.global_rank = self.rpc_rank' in inspect.getsource(m.WorkerWrapperBase.adjust_rank), \
+'vLLM patch did not stick'" \
+	|| { echo "ERROR: post-patch verification failed. Aborting."; exit 1; }
+
+# =============================================================================
 # USER CONFIGURATION
 # =============================================================================
 
