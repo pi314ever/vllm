@@ -128,10 +128,17 @@ NUM_WARMUPS="${NUM_WARMUPS:-10}"
 # NETWORK CONFIGURATION (Polaris Slingshot)
 # =============================================================================
 # Polaris uses HPE Slingshot interconnect. The high-speed network interfaces
-# are typically named hsn0, hsn1, etc. Uncomment and adjust if needed.
+# are typically named hsn0, hsn1, etc. All inter-node traffic (NCCL, Gloo,
+# Ray, and vLLM control plane) MUST use the same IP family or Ray's
+# placement-group node-affinity constraint ("node:<ip>" resource) will not
+# be satisfiable -- vLLM requests `node:<VLLM_HOST_IP>` for the driver
+# bundle, and that IP has to match the IP Ray registered the node under.
 #
-export NCCL_SOCKET_IFNAME=hsn0
-export GLOO_SOCKET_IFNAME=hsn0
+# The interface name used for both NCCL/Gloo and Ray/VLLM_HOST_IP:
+RAY_IFNAME="${RAY_IFNAME:-hsn0}"
+
+export NCCL_SOCKET_IFNAME="${RAY_IFNAME}"
+export GLOO_SOCKET_IFNAME="${RAY_IFNAME}"
 export NCCL_DEBUG=WARN
 
 # Disable Ray usage stats
@@ -161,18 +168,61 @@ HEAD_HOST="${ALL_NODES[0]}"
 WORKER1_HOST="${ALL_NODES[1]}"
 WORKER2_HOST="${ALL_NODES[2]}"
 
-# Resolve hostnames to IPs for VLLM_HOST_IP / Ray communication.
-# On Polaris, the PBS hostnames are directly resolvable.
-resolve_ip() {
-	local host="$1"
-	# getent hosts returns "<ip> <hostname> [aliases...]"; grab the first field.
-	# Fall back to the hostname itself if resolution fails.
-	getent hosts "${host}" | awk '{print $1; exit}' || echo "${host}"
+# -----------------------------------------------------------------------------
+# IP resolution
+# -----------------------------------------------------------------------------
+# We MUST use the Slingshot (${RAY_IFNAME}) IP for Ray / VLLM_HOST_IP, not the
+# default hostname IP returned by `getent hosts`. On Polaris, `getent hosts
+# <node>` typically returns a management-network IP, while NCCL/Gloo traffic
+# goes over hsn0 (10.201.x.x). When Ray registers a node under one IP but
+# vLLM's EngineCore (which probes its own IP via a UDP socket to 8.8.8.8)
+# discovers a different IP, vLLM's placement-group request
+# `node:<current_ip>: 0.001` can never be satisfied and you will see:
+#
+#   Waiting for creating a placement group of specs for 30 seconds.
+#   specs=[{'node:10.201.3.102': 0.001, 'GPU': 1.0}, ...]
+#
+# forever. The fix is to force Ray to register each node under its hsn0 IP
+# AND to export VLLM_HOST_IP=<hsn0-ip> everywhere so the two match.
+
+# Return the IPv4 address of the local interface ${RAY_IFNAME}.
+local_ifname_ip() {
+	local ifname="${1:-${RAY_IFNAME}}"
+	# Prefer `ip -4`; fall back to `hostname -I` scanning if `ip` is unavailable.
+	if command -v ip &>/dev/null; then
+		ip -4 -o addr show dev "${ifname}" 2>/dev/null |
+			awk '{print $4}' | cut -d'/' -f1 | head -n1
+	else
+		# Fallback: look up via /sys/class/net... last resort.
+		awk '{print $1}' "/sys/class/net/${ifname}/address" 2>/dev/null || true
+	fi
 }
 
-HEAD_IP="$(resolve_ip "${HEAD_HOST}")"
-WORKER1_IP="$(resolve_ip "${WORKER1_HOST}")"
-WORKER2_IP="$(resolve_ip "${WORKER2_HOST}")"
+# Return the IPv4 address of ${RAY_IFNAME} on a remote host via mpiexec.
+remote_ifname_ip() {
+	local host="$1"
+	local ifname="${2:-${RAY_IFNAME}}"
+	mpiexec -n 1 --ppn 1 --hosts "${host}" -- bash -c \
+		"ip -4 -o addr show dev '${ifname}' | awk '{print \$4}' | cut -d'/' -f1 | head -n1" \
+		2>/dev/null | tr -d '[:space:]'
+}
+
+HEAD_IP="$(local_ifname_ip "${RAY_IFNAME}")"
+if [[ -z "${HEAD_IP}" ]]; then
+	echo "ERROR: Could not determine IP for interface ${RAY_IFNAME} on head node ${HEAD_HOST}."
+	echo "       Set RAY_IFNAME to the correct interface (e.g. RAY_IFNAME=hsn1) and retry."
+	exit 1
+fi
+
+WORKER1_IP="$(remote_ifname_ip "${WORKER1_HOST}" "${RAY_IFNAME}")"
+WORKER2_IP="$(remote_ifname_ip "${WORKER2_HOST}" "${RAY_IFNAME}")"
+
+if [[ -z "${WORKER1_IP}" || -z "${WORKER2_IP}" ]]; then
+	echo "ERROR: Could not resolve ${RAY_IFNAME} IP on one or more workers:"
+	echo "       ${WORKER1_HOST} -> '${WORKER1_IP}'"
+	echo "       ${WORKER2_HOST} -> '${WORKER2_IP}'"
+	exit 1
+fi
 
 echo "============================================="
 echo "  PBS 3-Node DeepSeek-R1 Benchmark"
@@ -251,12 +301,16 @@ trap cleanup EXIT INT TERM
 echo ""
 echo "[Step 1/5] Starting Ray head node on ${HEAD_HOST} (${HEAD_IP}:${RAY_PORT})..."
 
+# VLLM_HOST_IP MUST match the IP Ray registers the node under (--node-ip-address
+# below); otherwise vLLM's placement-group request `node:<VLLM_HOST_IP>: 0.001`
+# for the driver bundle will be unsatisfiable.
 export VLLM_HOST_IP="${HEAD_IP}"
 
 ray stop --force 2>/dev/null || true
 sleep 2
 
 ray start --head \
+	--node-ip-address="${HEAD_IP}" \
 	--port="${RAY_PORT}" \
 	--num-gpus="${TP_SIZE}" \
 	--temp-dir="${RAY_TMPDIR}" \
@@ -316,6 +370,7 @@ launch_worker() {
 		while true; do
 			if ray start \\
 				--address='${HEAD_IP}:${RAY_PORT}' \\
+				--node-ip-address='${worker_ip}' \\
 				--num-gpus=${TP_SIZE} \\
 				--temp-dir='${RAY_TMPDIR}' \\
 				--block; then
