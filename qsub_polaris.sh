@@ -336,6 +336,30 @@ export NCCL_DEBUG=WARN
 export RAY_USAGE_STATS_ENABLED=0
 
 # =============================================================================
+# RAY EXECUTOR BACKEND
+# =============================================================================
+# vLLM's default RayDistributedExecutor uses Ray Compiled Graph (aDAG) for PP.
+# On Polaris at PP=6 this hits a RayChannelTimeoutError ~300s into the first
+# decode step: the first cross-node NCCL send/recv via RayPPCommunicator stalls
+# during lazy ring setup, the last-PP-rank output never lands, and vLLM's
+# `ray.get(ref, timeout=RAY_CGRAPH_get_timeout)` fires.
+#
+# Switch to RayExecutorV2, which subclasses MultiprocExecutor and uses
+# MessageQueue (shm_broadcast) + plain Ray actor RPC. That removes the aDAG
+# code path (and the RAY_CGRAPH_get_timeout read) entirely.
+# See vllm/v1/executor/abstract.py:61 and vllm/v1/executor/ray_executor_v2.py.
+export VLLM_USE_RAY_V2_EXECUTOR_BACKEND="${VLLM_USE_RAY_V2_EXECUTOR_BACKEND:-1}"
+
+# Fallbacks. Uncomment if V2 *also* hangs at the first decode step, which
+# would mean the real culprit is NCCL-over-Slingshot (not Ray aDAG), and we
+# need ALCF-level networking diagnostics rather than vLLM-level knobs.
+#   1. Longer aDAG read timeout (only relevant if you disable V2 and go back
+#      to the default RayDistributedExecutor):
+# export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-1800}"
+#   2. Verbose NCCL output to locate the hanging peer pair on hsn0:
+# export NCCL_DEBUG=INFO
+
+# =============================================================================
 # THREAD LIMITS
 # =============================================================================
 # Polaris compute nodes have 32 physical CPU cores per node. With TP=4 GPUs
@@ -574,6 +598,11 @@ launch_worker() {
 		export RAY_USAGE_STATS_ENABLED=0
 		export RAY_TMPDIR='${RAY_TMPDIR}'
 		mkdir -p '${RAY_TMPDIR}'
+
+		# Ray executor backend: keep workers in sync with the head-node env so
+		# any worker-side code that re-reads VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+		# sees the same value. Selection itself happens on the driver.
+		export VLLM_USE_RAY_V2_EXECUTOR_BACKEND='${VLLM_USE_RAY_V2_EXECUTOR_BACKEND}'
 
 		# Thread limits (must match head node; see RLIMIT_NPROC note above).
 		export OMP_NUM_THREADS='${OMP_NUM_THREADS}'
