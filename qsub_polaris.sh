@@ -3,34 +3,49 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # =============================================================================
-# PBS Pro Job Script - 3-Node DeepSeek-R1 Benchmark on ALCF Polaris
+# PBS Pro Job Script - N-Node DeepSeek-R1 Benchmark on ALCF Polaris
 # =============================================================================
 #
-# Single qsub-submittable script that orchestrates the full 3-node benchmark:
+# Single qsub-submittable script that orchestrates the full N-node benchmark:
 #   1. Discovers allocated nodes from PBS_NODEFILE
-#   2. Launches Ray head on node 0, Ray workers on nodes 1 & 2 (via mpiexec)
+#   2. Launches Ray head on node 0, Ray workers on nodes 1..N-1 (via mpiexec)
 #   3. Runs offline latency benchmarks (vllm bench latency)
 #   4. Starts vLLM API server and runs online serving benchmarks
 #   5. Cleans up Ray on all nodes on exit
 #
-# Configuration: PP=3, TP=4, EP enabled (ep_size=4 for MoE layers)
-# Hardware:      3 Polaris nodes x 4x A100-80GB = 12 GPUs total
+# Parallelism model (defaults):
+#   NUM_NODES=4, GPUS_PER_NODE=4  -> 16 GPUs total
+#   PP_SIZE=4, TP_SIZE=4          -> PP across nodes, TP within each node
+#   --enable-expert-parallel      -> EP size = TP_SIZE * DP_SIZE = 4 (DP=1)
+#
+# NOTE on EP: vLLM exposes expert parallelism as a boolean flag
+# (--enable-expert-parallel). The effective EP group size is TP * DP. To get
+# EP=M with DP=1, set TP_SIZE=M. To get EP=M with DP>1, size TP and DP so
+# that TP*DP=M and PP*TP*DP = NUM_NODES*GPUS_PER_NODE (DP is not configured
+# by this script; extend QUANT_ARGS / ENGINE_ARGS if you need it).
+#
+# Hardware:      Polaris nodes x 4x A100-80GB
 # Model:         deepseek-ai/DeepSeek-R1 (671B MoE, FP8)
 #
 # Usage:
 #   # Edit the -A project allocation below, then:
-#   qsub qsub_polaris_3node.sh
+#   qsub qsub_polaris.sh
 #
-#   # Or override settings at submission time:
-#   qsub -v MODEL=/path/to/model,MAX_MODEL_LEN=8192 qsub_polaris_3node.sh
+#   # Override settings at submission time (note: the PBS `select=` directive
+#   # is baked into the file, so if you change NUM_NODES you must either edit
+#   # the -l select=... line below OR override it on the qsub command line):
+#   qsub -l select=6:system=polaris:ncpus=32:ngpus=4 \
+#        -v NUM_NODES=6,PP_SIZE=6,TP_SIZE=4 qsub_polaris.sh
 #
 # =============================================================================
 
 # =============================================================================
 # PBS DIRECTIVES
 # =============================================================================
+# NOTE: The `select=N` count here MUST match NUM_NODES in the user config
+# section below, or be overridden at submission time with `qsub -l select=...`.
 
-#PBS -l select=3:system=polaris:ncpus=32:ngpus=4
+#PBS -l select=4:system=polaris:ncpus=32:ngpus=4
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:grand
 #PBS -q debug-scaling
@@ -90,15 +105,37 @@ if [[ -n "${QUANTIZATION}" ]]; then
 	QUANT_ARGS=(--quantization "${QUANTIZATION}")
 fi
 
-# Parallelism configuration
+# Parallelism / cluster sizing
+#
+# NUM_NODES     : Number of Polaris nodes (must match the PBS `select=` count).
+# GPUS_PER_NODE : GPUs per node (4 on Polaris A100 nodes).
+# TP_SIZE       : Tensor-parallel size. Must evenly divide GPUS_PER_NODE so
+#                 TP groups stay inside a node (NVLink).
+# PP_SIZE       : Pipeline-parallel size. PP groups span nodes.
+# EP_SIZE       : Expert-parallel group size (DERIVED, not set directly).
+#                 With --enable-expert-parallel and DP=1, EP_SIZE == TP_SIZE.
+#
+# Invariant: PP_SIZE * TP_SIZE == NUM_NODES * GPUS_PER_NODE
+NUM_NODES="${NUM_NODES:-4}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 TP_SIZE="${TP_SIZE:-4}"
-PP_SIZE="${PP_SIZE:-3}"
+PP_SIZE="${PP_SIZE:-4}"
 
 # Ray configuration
 RAY_PORT="${RAY_PORT:-6379}"
-EXPECTED_NODES=3
-EXPECTED_GPUS=12                                  # 3 nodes * 4 GPUs
+EXPECTED_NODES="${NUM_NODES}"
+EXPECTED_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+EP_SIZE="${TP_SIZE}" # derived; only valid while DP=1
 RAY_CLUSTER_TIMEOUT="${RAY_CLUSTER_TIMEOUT:-600}" # seconds
+
+# Sanity check: total GPU count must match PP * TP.
+if (( PP_SIZE * TP_SIZE != EXPECTED_GPUS )); then
+	echo "ERROR: Invalid parallelism configuration."
+	echo "       PP_SIZE (${PP_SIZE}) * TP_SIZE (${TP_SIZE}) = $((PP_SIZE * TP_SIZE))"
+	echo "       NUM_NODES (${NUM_NODES}) * GPUS_PER_NODE (${GPUS_PER_NODE}) = ${EXPECTED_GPUS}"
+	echo "       These must be equal."
+	exit 1
+fi
 
 # Use a short temp dir to avoid AF_UNIX 107-byte socket path limit.
 # PBS on Polaris sets $TMPDIR to very long paths like:
@@ -108,8 +145,10 @@ RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${PBS_JOBID%%.*}}"
 export RAY_TMPDIR
 mkdir -p "${RAY_TMPDIR}"
 
-# GPU visibility (4 GPUs per node on Polaris)
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+# GPU visibility: expose GPUS_PER_NODE devices per node (0,1,...,N-1)
+_default_cvd="$(seq -s, 0 $((GPUS_PER_NODE - 1)))"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${_default_cvd}}"
+unset _default_cvd
 
 # Benchmark output directory (under PBS job working directory)
 RESULTS_DIR="${RESULTS_DIR:-${PBS_O_WORKDIR:-.}/results_${PBS_JOBID:-manual}}"
@@ -181,7 +220,7 @@ export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
 
 if [[ -z "${PBS_NODEFILE:-}" ]]; then
 	echo "ERROR: PBS_NODEFILE is not set. This script must be submitted via qsub."
-	echo "Usage: qsub qsub_polaris_3node.sh"
+	echo "Usage: qsub qsub_polaris.sh"
 	exit 1
 fi
 
@@ -189,15 +228,15 @@ fi
 # PBS runs this script on the first node, so ALL_NODES[0] is the head.
 mapfile -t ALL_NODES < <(awk '!seen[$0]++' "${PBS_NODEFILE}")
 
-if [[ "${#ALL_NODES[@]}" -lt 3 ]]; then
-	echo "ERROR: Expected 3 nodes, but PBS allocated ${#ALL_NODES[@]}:"
+if [[ "${#ALL_NODES[@]}" -lt "${NUM_NODES}" ]]; then
+	echo "ERROR: Expected ${NUM_NODES} nodes, but PBS allocated ${#ALL_NODES[@]}:"
 	printf "  %s\n" "${ALL_NODES[@]}"
 	exit 1
 fi
 
 HEAD_HOST="${ALL_NODES[0]}"
-WORKER1_HOST="${ALL_NODES[1]}"
-WORKER2_HOST="${ALL_NODES[2]}"
+# Take exactly NUM_NODES-1 workers (ignore any extra nodes PBS allocated).
+WORKER_HOSTS=("${ALL_NODES[@]:1:$((NUM_NODES - 1))}")
 
 # -----------------------------------------------------------------------------
 # IP resolution
@@ -245,28 +284,29 @@ if [[ -z "${HEAD_IP}" ]]; then
 	exit 1
 fi
 
-WORKER1_IP="$(remote_ifname_ip "${WORKER1_HOST}" "${RAY_IFNAME}")"
-WORKER2_IP="$(remote_ifname_ip "${WORKER2_HOST}" "${RAY_IFNAME}")"
-
-if [[ -z "${WORKER1_IP}" || -z "${WORKER2_IP}" ]]; then
-	echo "ERROR: Could not resolve ${RAY_IFNAME} IP on one or more workers:"
-	echo "       ${WORKER1_HOST} -> '${WORKER1_IP}'"
-	echo "       ${WORKER2_HOST} -> '${WORKER2_IP}'"
-	exit 1
-fi
+WORKER_IPS=()
+for WHOST in "${WORKER_HOSTS[@]}"; do
+	WIP="$(remote_ifname_ip "${WHOST}" "${RAY_IFNAME}")"
+	if [[ -z "${WIP}" ]]; then
+		echo "ERROR: Could not resolve ${RAY_IFNAME} IP on worker ${WHOST}."
+		exit 1
+	fi
+	WORKER_IPS+=("${WIP}")
+done
 
 echo "============================================="
-echo "  PBS 3-Node DeepSeek-R1 Benchmark"
+echo "  PBS ${NUM_NODES}-Node DeepSeek-R1 Benchmark"
 echo "============================================="
 echo "  Job ID:         ${PBS_JOBID:-N/A}"
 echo "  Head node:      ${HEAD_HOST} (${HEAD_IP})"
-echo "  Worker 1:       ${WORKER1_HOST} (${WORKER1_IP})"
-echo "  Worker 2:       ${WORKER2_HOST} (${WORKER2_IP})"
+for i in "${!WORKER_HOSTS[@]}"; do
+	printf "  Worker %-9s %s (%s)\n" "$((i + 1)):" "${WORKER_HOSTS[$i]}" "${WORKER_IPS[$i]}"
+done
 echo "  Model:          ${MODEL}"
 echo "  Quantization:   ${QUANTIZATION:-none}"
 echo "  TP size:        ${TP_SIZE}"
 echo "  PP size:        ${PP_SIZE}"
-echo "  EP:             enabled"
+echo "  EP size:        ${EP_SIZE} (derived: TP * DP, DP=1)"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
 echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
@@ -278,8 +318,7 @@ echo "============================================="
 # =============================================================================
 # Ensure Ray is stopped on all nodes and background jobs are killed on exit.
 
-WORKER1_PID=""
-WORKER2_PID=""
+WORKER_PIDS=()
 SERVER_PID=""
 
 cleanup() {
@@ -297,14 +336,14 @@ cleanup() {
 	echo "  Stopping Ray on head node (${HEAD_HOST})..."
 	ray stop --force 2>/dev/null || true
 
-	for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
+	for WHOST in "${WORKER_HOSTS[@]}"; do
 		echo "  Stopping Ray on ${WHOST}..."
 		mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
 			"source '${VENV_DIR}/bin/activate' && ray stop --force" 2>/dev/null || true
 	done
 
 	# Kill background mpiexec worker sessions
-	for WPID in "${WORKER1_PID}" "${WORKER2_PID}"; do
+	for WPID in "${WORKER_PIDS[@]}"; do
 		if [[ -n "${WPID}" ]]; then
 			kill "${WPID}" 2>/dev/null || true
 			wait "${WPID}" 2>/dev/null || true
@@ -315,7 +354,7 @@ cleanup() {
 	if [[ -n "${RAY_TMPDIR:-}" ]]; then
 		echo "  Removing Ray temp dir ${RAY_TMPDIR}..."
 		rm -rf "${RAY_TMPDIR}" 2>/dev/null || true
-		for WHOST in "${WORKER1_HOST}" "${WORKER2_HOST}"; do
+		for WHOST in "${WORKER_HOSTS[@]}"; do
 			mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
 				"rm -rf '${RAY_TMPDIR}'" 2>/dev/null || true
 		done
@@ -344,7 +383,7 @@ sleep 2
 ray start --head \
 	--node-ip-address="${HEAD_IP}" \
 	--port="${RAY_PORT}" \
-	--num-gpus="${TP_SIZE}" \
+	--num-gpus="${GPUS_PER_NODE}" \
 	--temp-dir="${RAY_TMPDIR}" \
 	--dashboard-host=0.0.0.0
 
@@ -362,11 +401,11 @@ export RAY_ADDRESS="${HEAD_IP}:${RAY_PORT}"
 echo "Exported RAY_ADDRESS=${RAY_ADDRESS} for vLLM subprocesses."
 
 # =============================================================================
-# STEP 2: Start Ray Workers on Nodes 1 & 2 (via mpiexec)
+# STEP 2: Start Ray Workers on Nodes 1..N-1 (via mpiexec)
 # =============================================================================
 
 echo ""
-echo "[Step 2/5] Starting Ray workers on ${WORKER1_HOST} and ${WORKER2_HOST}..."
+echo "[Step 2/5] Starting Ray workers on ${#WORKER_HOSTS[@]} node(s): ${WORKER_HOSTS[*]}"
 
 # Helper: launch a Ray worker on a remote node via mpiexec.
 # The worker runs with --block so the mpiexec session stays alive until Ray stops.
@@ -417,7 +456,7 @@ launch_worker() {
 			if ray start \\
 				--address='${HEAD_IP}:${RAY_PORT}' \\
 				--node-ip-address='${worker_ip}' \\
-				--num-gpus=${TP_SIZE} \\
+				--num-gpus=${GPUS_PER_NODE} \\
 				--temp-dir='${RAY_TMPDIR}' \\
 				--block; then
 				echo '[${worker_label}] Disconnected from cluster.'
@@ -436,14 +475,13 @@ launch_worker() {
 	"
 }
 
-# Launch workers in background
-launch_worker "${WORKER1_HOST}" "${WORKER1_IP}" "Worker1" &
-WORKER1_PID=$!
+# Launch all workers in background
+for i in "${!WORKER_HOSTS[@]}"; do
+	launch_worker "${WORKER_HOSTS[$i]}" "${WORKER_IPS[$i]}" "Worker$((i + 1))" &
+	WORKER_PIDS+=($!)
+done
 
-launch_worker "${WORKER2_HOST}" "${WORKER2_IP}" "Worker2" &
-WORKER2_PID=$!
-
-echo "Worker mpiexec sessions launched (PIDs: ${WORKER1_PID}, ${WORKER2_PID})"
+echo "Worker mpiexec sessions launched (PIDs: ${WORKER_PIDS[*]})"
 
 # =============================================================================
 # STEP 3: Wait for All Nodes to Join the Cluster
@@ -466,19 +504,19 @@ print(f'{len(alive)},{int(total_gpus)}')
 ray.shutdown()
 " 2>/dev/null || echo "0,0")
 
-	NUM_NODES=$(echo "${ACTIVE_NODES}" | cut -d',' -f1)
-	NUM_GPUS=$(echo "${ACTIVE_NODES}" | cut -d',' -f2)
+	LIVE_NODES=$(echo "${ACTIVE_NODES}" | cut -d',' -f1)
+	LIVE_GPUS=$(echo "${ACTIVE_NODES}" | cut -d',' -f2)
 
-	echo "  Nodes: ${NUM_NODES}/${EXPECTED_NODES}, GPUs: ${NUM_GPUS}/${EXPECTED_GPUS} (${ELAPSED}s elapsed)"
+	echo "  Nodes: ${LIVE_NODES}/${EXPECTED_NODES}, GPUs: ${LIVE_GPUS}/${EXPECTED_GPUS} (${ELAPSED}s elapsed)"
 
-	if [[ "${NUM_GPUS}" -ge "${EXPECTED_GPUS}" ]]; then
-		echo "All nodes joined! Cluster ready with ${NUM_NODES} nodes and ${NUM_GPUS} GPUs."
+	if [[ "${LIVE_GPUS}" -ge "${EXPECTED_GPUS}" ]]; then
+		echo "All nodes joined! Cluster ready with ${LIVE_NODES} nodes and ${LIVE_GPUS} GPUs."
 		break
 	fi
 
 	if [[ "${ELAPSED}" -ge "${RAY_CLUSTER_TIMEOUT}" ]]; then
 		echo "ERROR: Timed out waiting for nodes after ${RAY_CLUSTER_TIMEOUT}s."
-		echo "       Got ${NUM_NODES} nodes / ${NUM_GPUS} GPUs, expected ${EXPECTED_NODES} / ${EXPECTED_GPUS}."
+		echo "       Got ${LIVE_NODES} nodes / ${LIVE_GPUS} GPUs, expected ${EXPECTED_NODES} / ${EXPECTED_GPUS}."
 		exit 1
 	fi
 
@@ -494,7 +532,7 @@ mkdir -p "${RESULTS_DIR}"
 
 echo ""
 echo "[Step 4/5] Running offline latency benchmarks..."
-echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=on"
+echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
 echo ""
 
 ENGINE_ARGS=(
@@ -641,7 +679,7 @@ for IO_CONFIG in "${IO_CONFIGS[@]}"; do
 			--metadata \
 			tp="${TP_SIZE}" \
 			pp="${PP_SIZE}" \
-			ep=true \
+			ep="${EP_SIZE}" \
 			quantization="${QUANTIZATION:-none}" \
 			input_len="${INPUT_LEN}" \
 			output_len="${OUTPUT_LEN}" \
