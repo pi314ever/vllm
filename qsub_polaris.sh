@@ -423,6 +423,43 @@ export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
 export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-${NUM_THREADS_PER_WORKER}}"
 
 # =============================================================================
+# SUBPROCESS FAN-OUT LIMITS (Inductor + ALCF XALT)
+# =============================================================================
+# On Polaris we have repeatedly hit:
+#
+#   /opt/cray/pe/lmod/lmod/init/bash: fork: retry: Resource temporarily unavailable
+#   /soft/xalt/.../bin/ld: fork: retry: Resource temporarily unavailable
+#   collect2: error: ld returned 254 exit status
+#   ... subprocess.CalledProcessError: ... gcc ... cuda_utils.c ...
+#
+# during torch.compile / Triton JIT on worker startup. Root causes:
+#
+# 1. torch._inductor.async_compile defaults TORCHINDUCTOR_COMPILE_THREADS
+#    to min(32, nproc). With TP=4 workers per node on 32-core Polaris
+#    nodes, that is 4 * 32 = 128 gcc-invoking helper processes per node
+#    on top of the main worker / Ray actor / driver processes.
+#
+# 2. On ALCF, /usr/bin/ld is shadowed by /soft/xalt/.../bin/ld, a bash
+#    wrapper that re-sources Lmod init on every ld invocation. Each
+#    gcc->ld call therefore fans out into several extra fork()s
+#    (bash + module-source subshells) before the real linker runs.
+#
+# Together these saturate the per-user / cgroup pids budget and the
+# first synchronous compile_module_from_src("cuda_utils") call in the
+# main worker dies with EAGAIN from fork().
+#
+# Fix 1: force Inductor to compile serially in each worker. First-run
+# cold-compile is slower, but results land in TORCHINDUCTOR_CACHE_DIR
+# (shared on /grand) so later runs skip it.
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
+
+# Fix 2: disable XALT executable tracking so the ld wrapper short-
+# circuits to a plain exec of the real linker and stops re-sourcing
+# Lmod on every link. This is a documented ALCF escape hatch; it only
+# affects XALT's telemetry, not job correctness or allowed software.
+export XALT_EXECUTABLE_TRACKING="${XALT_EXECUTABLE_TRACKING:-no}"
+
+# =============================================================================
 # NODE DISCOVERY FROM PBS
 # =============================================================================
 
@@ -586,6 +623,32 @@ echo "[Step 1/5] Starting Ray head node on ${HEAD_HOST} (${HEAD_IP}:${RAY_PORT})
 # for the driver bundle will be unsatisfiable.
 export VLLM_HOST_IP="${HEAD_IP}"
 
+# -----------------------------------------------------------------------------
+# Process-limit diagnostics (head node, read-only)
+# -----------------------------------------------------------------------------
+# If we ever see `fork: Resource temporarily unavailable` again during
+# Triton / Inductor JIT, this block captures the binding limit's shape
+# at job start so we know whether to blame RLIMIT_NPROC or the PBS
+# cgroup's pids.max. Everything below is read-only (ulimit reads, cat on
+# /sys/fs/cgroup, ps). No limits are raised.
+echo ""
+echo "=== Process limit diagnostics (head node $(hostname)) ==="
+echo "  ulimit -u (soft):      $(ulimit -u 2>/dev/null || echo unknown)"
+echo "  ulimit -Hu (hard):     $(ulimit -Hu 2>/dev/null || echo unknown)"
+if [[ -r /sys/fs/cgroup/pids.max ]]; then
+	echo "  cgroup pids.max:       $(cat /sys/fs/cgroup/pids.max)"
+	echo "  cgroup pids.current:   $(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo unknown)"
+elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+	echo "  cgroup pids.max (v1):     $(cat /sys/fs/cgroup/pids/pids.max)"
+	echo "  cgroup pids.current (v1): $(cat /sys/fs/cgroup/pids/pids.current 2>/dev/null || echo unknown)"
+else
+	echo "  cgroup pids.max:       not readable"
+fi
+echo "  current pids (uid=$USER): $(ps -u "$USER" --no-headers 2>/dev/null | wc -l)"
+echo "  nproc:                 $(nproc 2>/dev/null || echo unknown)"
+echo "========================================================="
+echo ""
+
 ray stop --force 2>/dev/null || true
 sleep 2
 
@@ -653,6 +716,13 @@ launch_worker() {
 		export VECLIB_MAXIMUM_THREADS='${VECLIB_MAXIMUM_THREADS}'
 		export RAYON_NUM_THREADS='${RAYON_NUM_THREADS}'
 		export TORCH_NUM_THREADS='${TORCH_NUM_THREADS}'
+
+		# Subprocess fan-out caps (must match head node; see the
+		# SUBPROCESS FAN-OUT LIMITS block in the driver script).
+		# - Inductor: compile serially per worker (no 32-way subprocess pool).
+		# - XALT: skip Lmod re-source on every ld invocation.
+		export TORCHINDUCTOR_COMPILE_THREADS='${TORCHINDUCTOR_COMPILE_THREADS}'
+		export XALT_EXECUTABLE_TRACKING='${XALT_EXECUTABLE_TRACKING}'
 
 		# NCCL/Gloo must use the same interface as on the head node.
 		export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
