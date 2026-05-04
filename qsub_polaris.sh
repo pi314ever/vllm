@@ -782,14 +782,20 @@ print_process_diagnostics "job start (pre-Ray)"
 ray stop --force 2>/dev/null || true
 sleep 2
 
+# Dashboard is disabled to reduce thread count under Polaris's cgroup
+# pids.max=4096 cap. The dashboard aiohttp server + its per-node agent
+# together contribute ~30-80 threads to the budget and we don't use
+# the UI in non-interactive benchmark jobs. Re-enable with
+# --include-dashboard=true --dashboard-host=0.0.0.0 if you need the
+# cluster UI for live debugging.
 ray start --head \
 	--node-ip-address="${HEAD_IP}" \
 	--port="${RAY_PORT}" \
 	--num-gpus="${GPUS_PER_NODE}" \
 	--temp-dir="${RAY_TMPDIR}" \
-	--dashboard-host=0.0.0.0
+	--include-dashboard=false
 
-echo "Ray head started. Dashboard: http://${HEAD_IP}:8265"
+echo "Ray head started. (dashboard disabled to conserve cgroup pids.max budget)"
 
 # Tell vLLM drivers and every subprocess they spawn to ATTACH to this Ray
 # cluster rather than fall through to ray.init(address=None) and start a
@@ -986,6 +992,15 @@ ENGINE_ARGS=(
 	--distributed-executor-backend ray
 	--max-model-len "${MAX_MODEL_LEN}"
 	--trust-remote-code
+	# --enforce-eager skips torch.compile AND CUDA graph capture.
+	# Required under Polaris's cgroup pids.max=4096 cap: CUDA graph
+	# capture spawns hundreds of transient threads (one batch-shape at
+	# a time, but the total thread churn pushes peak pids past the
+	# cap). Cluster-ready diagnostics landed at 3498/4096 already, so
+	# we have no room for the graph-capture transient. Trade-off:
+	# 1.5-2x slower at small batch; benchmark numbers should be
+	# annotated as "eager-mode" until ALCF raises the pids.max limit.
+	--enforce-eager
 )
 
 # Latency sweep matrix.
@@ -1060,6 +1075,7 @@ vllm serve "${MODEL}" \
 	--distributed-executor-backend ray \
 	--max-model-len "${MAX_MODEL_LEN}" \
 	--trust-remote-code \
+	--enforce-eager \
 	--host 0.0.0.0 \
 	--port "${SERVE_PORT}" \
 	>"${RESULTS_DIR}/server.log" 2>&1 &
