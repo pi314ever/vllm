@@ -343,9 +343,11 @@ SERVE_PORT="${SERVE_PORT:-8000}"
 # Max model length
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 
-# Number of prompts / warmups for serving benchmark
-NUM_PROMPTS="${NUM_PROMPTS:-500}"
-NUM_WARMUPS="${NUM_WARMUPS:-10}"
+# Number of prompts / warmups for serving benchmark.
+# Sized to fit within Polaris's 1h debug-scaling queue walltime. Raise
+# when submitting to a longer-walltime queue (e.g. prod).
+NUM_PROMPTS="${NUM_PROMPTS:-200}"
+NUM_WARMUPS="${NUM_WARMUPS:-2}"
 
 # =============================================================================
 # NETWORK CONFIGURATION (Polaris Slingshot)
@@ -458,6 +460,50 @@ export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 # Lmod on every link. This is a documented ALCF escape hatch; it only
 # affects XALT's telemetry, not job correctness or allowed software.
 export XALT_EXECUTABLE_TRACKING="${XALT_EXECUTABLE_TRACKING:-no}"
+
+# =============================================================================
+# ADDITIONAL THREAD-COUNT REDUCTION (targets cgroup pids.max pressure)
+# =============================================================================
+# After the Inductor + XALT fixes, the engine made it all the way through
+# model init and CUDA graph capture, but then died at libzmq's
+# `pthread_create` in the EngineCore output-dispatcher thread with
+# "Resource temporarily unavailable". Diagnostics showed ulimit -u at
+# 2.06M so RLIMIT_NPROC is not the cap; the binding limit must be the
+# PBS cgroup's pids.max (which we couldn't read at cgroup root and
+# which the expanded diagnostics will now walk /proc/self/cgroup to
+# find).
+#
+# ZMQ's own footprint inside EngineCore is already at its floor: every
+# context uses io_threads=1, which is libzmq's minimum for TCP
+# sockets. The real headroom is in other subsystems' thread pools.
+# Each knob below targets a specific source; together they should
+# free ~30-80 threads per node at steady state.
+
+# NCCL: default socket-thread fan-out (NCCL_SOCKET_NTHREADS *
+# NCCL_NSOCKS_PERTHREAD) is tuned for hundred-GB throughput. On
+# 16-GPU DeepSeek at benchmark loads it's overkill and contributes
+# ~30-50 threads per node. May reduce inter-node all-reduce bandwidth;
+# revert both for production-throughput serving runs.
+export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-1}"
+export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-1}"
+
+# HuggingFace tokenizers: disable Rayon parallelism entirely. At
+# NUM_PROMPTS=200 the tokenizer throughput is not a bottleneck and
+# the Rayon pool is pure thread-budget waste. Emits a one-time HF
+# warning post-fork; harmless.
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+# Ray: disable the memory-monitor thread. At DeepSeek-671B /
+# A100-80GB / 16-GPU scale the workload is statically sized, so
+# OOM-watching buys us nothing and the thread counts against the
+# cgroup pids budget.
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+
+# vLLM / HuggingFace telemetry: skip background usage-stats upload
+# thread. Two spellings because different upstream code paths honor
+# different env var names.
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export DO_NOT_TRACK="${DO_NOT_TRACK:-1}"
 
 # =============================================================================
 # NODE DISCOVERY FROM PBS
@@ -612,6 +658,107 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # =============================================================================
+# PROCESS-LIMIT DIAGNOSTICS (head node, read-only)
+# =============================================================================
+# Captures the binding pids/threads limit shape at various points in the
+# job's lifecycle. Useful when workers are dying with EAGAIN-shaped errors
+# (fork / pthread_create / libzmq "Resource temporarily unavailable").
+# Everything here is read-only (ulimit reads, cat on /sys/fs/cgroup and
+# /proc, ps). No limits are ever raised.
+#
+# Called at:
+#   - job start (before ray head)
+#   - after the Ray cluster is fully ready (end of Step 3)
+#   - just before vllm serve (start of Step 5)
+print_process_diagnostics() {
+	local label="${1:-diagnostics}"
+
+	echo ""
+	echo "=== Process limit diagnostics: ${label} (host $(hostname)) ==="
+
+	# ulimits
+	echo "  ulimit -u  (soft nproc): $(ulimit -u 2>/dev/null || echo unknown)"
+	echo "  ulimit -Hu (hard nproc): $(ulimit -Hu 2>/dev/null || echo unknown)"
+	echo "  ulimit -s  (stack KB):   $(ulimit -s 2>/dev/null || echo unknown)"
+
+	# Kernel-wide ceilings
+	if [[ -r /proc/sys/kernel/pid_max ]]; then
+		echo "  kernel pid_max:          $(cat /proc/sys/kernel/pid_max)"
+	fi
+	if [[ -r /proc/sys/kernel/threads-max ]]; then
+		echo "  kernel threads-max:      $(cat /proc/sys/kernel/threads-max)"
+	fi
+
+	# Find the actual cgroup pids.max for THIS process. PBS on Polaris
+	# puts each job in a per-job cgroup subtree, so the root
+	# /sys/fs/cgroup/pids.max (if it exists at all) is not the binding
+	# limit. Walk /proc/self/cgroup and look for the nearest pids.max.
+	local cgpath=""
+	if [[ -r /proc/self/cgroup ]]; then
+		# cgroup v2 line:  "0::/pbs_jobid/..."
+		# cgroup v1 pids:  "N:pids:/pbs_jobid/..."
+		cgpath="$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup)"
+		if [[ -z "${cgpath}" ]]; then
+			cgpath="$(awk -F: '$2 == "pids" {print $3; exit}' /proc/self/cgroup)"
+		fi
+	fi
+
+	local pids_max_file=""
+	local pids_cur_file=""
+	if [[ -n "${cgpath}" ]]; then
+		# Walk up the cgroup hierarchy looking for the nearest pids.max.
+		local probe="${cgpath}"
+		while true; do
+			if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
+				pids_max_file="/sys/fs/cgroup${probe}/pids.max"
+				pids_cur_file="/sys/fs/cgroup${probe}/pids.current"
+				break
+			fi
+			# cgroup v1 pids controller path
+			if [[ -r "/sys/fs/cgroup/pids${probe}/pids.max" ]]; then
+				pids_max_file="/sys/fs/cgroup/pids${probe}/pids.max"
+				pids_cur_file="/sys/fs/cgroup/pids${probe}/pids.current"
+				break
+			fi
+			if [[ -z "${probe}" || "${probe}" == "/" ]]; then
+				break
+			fi
+			probe="${probe%/*}"
+		done
+	fi
+	# Fallbacks to cgroup root if the walk failed.
+	if [[ -z "${pids_max_file}" ]]; then
+		if [[ -r /sys/fs/cgroup/pids.max ]]; then
+			pids_max_file="/sys/fs/cgroup/pids.max"
+			pids_cur_file="/sys/fs/cgroup/pids.current"
+		elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+			pids_max_file="/sys/fs/cgroup/pids/pids.max"
+			pids_cur_file="/sys/fs/cgroup/pids/pids.current"
+		fi
+	fi
+
+	if [[ -n "${pids_max_file}" ]]; then
+		echo "  cgroup pids.max:         $(cat "${pids_max_file}" 2>/dev/null || echo unknown) (${pids_max_file})"
+		echo "  cgroup pids.current:     $(cat "${pids_cur_file}" 2>/dev/null || echo unknown)"
+	else
+		echo "  cgroup pids.max:         not found (cgpath='${cgpath:-none}')"
+	fi
+	if [[ -n "${cgpath}" ]]; then
+		echo "  /proc/self/cgroup path:  ${cgpath}"
+	fi
+
+	# Current usage by this user on this host.
+	echo "  pids (uid=${USER}):      $(ps -u "${USER}" --no-headers 2>/dev/null | wc -l)"
+	# Per-thread listing (`ps -L`) counts each OS thread once.
+	local thread_count
+	thread_count="$(ps -u "${USER}" -L --no-headers 2>/dev/null | wc -l || echo unknown)"
+	echo "  threads (uid=${USER}):   ${thread_count}"
+	echo "  nproc:                   $(nproc 2>/dev/null || echo unknown)"
+	echo "=============================================================="
+	echo ""
+}
+
+# =============================================================================
 # STEP 1: Start Ray Head Node (on this node)
 # =============================================================================
 
@@ -624,30 +771,13 @@ echo "[Step 1/5] Starting Ray head node on ${HEAD_HOST} (${HEAD_IP}:${RAY_PORT})
 export VLLM_HOST_IP="${HEAD_IP}"
 
 # -----------------------------------------------------------------------------
-# Process-limit diagnostics (head node, read-only)
+# Process-limit diagnostics (job start)
 # -----------------------------------------------------------------------------
-# If we ever see `fork: Resource temporarily unavailable` again during
-# Triton / Inductor JIT, this block captures the binding limit's shape
-# at job start so we know whether to blame RLIMIT_NPROC or the PBS
-# cgroup's pids.max. Everything below is read-only (ulimit reads, cat on
-# /sys/fs/cgroup, ps). No limits are raised.
-echo ""
-echo "=== Process limit diagnostics (head node $(hostname)) ==="
-echo "  ulimit -u (soft):      $(ulimit -u 2>/dev/null || echo unknown)"
-echo "  ulimit -Hu (hard):     $(ulimit -Hu 2>/dev/null || echo unknown)"
-if [[ -r /sys/fs/cgroup/pids.max ]]; then
-	echo "  cgroup pids.max:       $(cat /sys/fs/cgroup/pids.max)"
-	echo "  cgroup pids.current:   $(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo unknown)"
-elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
-	echo "  cgroup pids.max (v1):     $(cat /sys/fs/cgroup/pids/pids.max)"
-	echo "  cgroup pids.current (v1): $(cat /sys/fs/cgroup/pids/pids.current 2>/dev/null || echo unknown)"
-else
-	echo "  cgroup pids.max:       not readable"
-fi
-echo "  current pids (uid=$USER): $(ps -u "$USER" --no-headers 2>/dev/null | wc -l)"
-echo "  nproc:                 $(nproc 2>/dev/null || echo unknown)"
-echo "========================================================="
-echo ""
+# The previous "not readable" output for cgroup pids.max was because the
+# old block only checked the cgroup root, while PBS on Polaris places
+# each job in a per-job subtree under /sys/fs/cgroup/. The function
+# below walks /proc/self/cgroup to find the binding pids.max.
+print_process_diagnostics "job start (pre-Ray)"
 
 ray stop --force 2>/dev/null || true
 sleep 2
@@ -723,6 +853,19 @@ launch_worker() {
 		# - XALT: skip Lmod re-source on every ld invocation.
 		export TORCHINDUCTOR_COMPILE_THREADS='${TORCHINDUCTOR_COMPILE_THREADS}'
 		export XALT_EXECUTABLE_TRACKING='${XALT_EXECUTABLE_TRACKING}'
+
+		# Additional thread-count caps (must match head node; see the
+		# ADDITIONAL THREAD-COUNT REDUCTION block in the driver script).
+		# Targets cgroup pids.max pressure surfaced as libzmq
+		# pthread_create EAGAIN. Tokenizers/Ray/telemetry knobs are
+		# safe; NCCL caps reduce inter-node throughput, revert for
+		# production runs.
+		export NCCL_SOCKET_NTHREADS='${NCCL_SOCKET_NTHREADS}'
+		export NCCL_NSOCKS_PERTHREAD='${NCCL_NSOCKS_PERTHREAD}'
+		export TOKENIZERS_PARALLELISM='${TOKENIZERS_PARALLELISM}'
+		export RAY_memory_monitor_refresh_ms='${RAY_memory_monitor_refresh_ms}'
+		export VLLM_NO_USAGE_STATS='${VLLM_NO_USAGE_STATS}'
+		export DO_NOT_TRACK='${DO_NOT_TRACK}'
 
 		# NCCL/Gloo must use the same interface as on the head node.
 		export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
@@ -816,6 +959,12 @@ ray.shutdown()
 	ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 
+# Snapshot process/thread counts after the full Ray cluster is up. If
+# this snapshot is already near cgroup pids.max, we know the vLLM engine
+# startup cannot possibly succeed and we should bail before wasting GPU
+# time on a run that's going to die in pthread_create.
+print_process_diagnostics "cluster ready (post-Step 3)"
+
 # =============================================================================
 # STEP 4: Run Offline Latency Benchmarks
 # =============================================================================
@@ -839,9 +988,28 @@ ENGINE_ARGS=(
 	--trust-remote-code
 )
 
-BATCH_SIZES=(1 2 4 8 16 32)
-INPUT_LENS=(128 512 1024)
+# Latency sweep matrix.
+#
+# Each (BATCH_SIZE, INPUT_LEN) pair triggers a full `vllm bench latency`
+# invocation, which in turn spins up a fresh vLLM engine (model load,
+# profile, KV cache, warmup, CUDA graph capture). On 16x A100 DeepSeek
+# that's ~60-90s per invocation with a warm Inductor/Triton cache.
+#
+# The engine-init cost dominates the actual benchmark cost, so we keep
+# the sweep small: three batch sizes that span the light/medium/heavy
+# concurrency regimes, at a single representative input length. Edit
+# these arrays directly to expand coverage on a longer-walltime queue
+# (env-var overrides of bash arrays are awkward, so we don't wire them).
+BATCH_SIZES=(1 8 32)
+INPUT_LENS=(512)
 OUTPUT_LEN=128
+
+# Iteration counts. 2 warmup + 10 measured iters is the smallest window
+# where per-iter variance stays tight enough to report p50/p99 latency
+# meaningfully. Don't reduce further without also widening the iter-to-
+# iter variance bounds in downstream analysis.
+LATENCY_WARMUP_ITERS="${LATENCY_WARMUP_ITERS:-2}"
+LATENCY_ITERS="${LATENCY_ITERS:-10}"
 
 for INPUT_LEN in "${INPUT_LENS[@]}"; do
 	for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
@@ -855,8 +1023,8 @@ for INPUT_LEN in "${INPUT_LENS[@]}"; do
 			--batch-size "${BATCH_SIZE}" \
 			--input-len "${INPUT_LEN}" \
 			--output-len "${OUTPUT_LEN}" \
-			--num-iters-warmup 5 \
-			--num-iters 20 \
+			--num-iters-warmup "${LATENCY_WARMUP_ITERS}" \
+			--num-iters "${LATENCY_ITERS}" \
 			--output-json "${RESULT_FILE}" \
 			2>&1 | tee "${LOG_FILE}"
 
@@ -873,6 +1041,13 @@ echo ""
 # =============================================================================
 
 echo "[Step 5/5] Starting vLLM server and running serving benchmarks..."
+
+# Snapshot just before vllm serve. Between Step 4 (offline latency) and
+# here, the offline engine has torn itself down but some processes may
+# linger briefly. If pids.current is close to pids.max at this point,
+# the `vllm serve` subprocess tree below is likely to fail in the same
+# zmq pthread_create path we've hit before.
+print_process_diagnostics "pre-vllm-serve (Step 5 start)"
 
 # Start the vLLM server in the background.
 # Use a process group so we can cleanly kill the server and its children.
@@ -924,14 +1099,18 @@ while true; do
 done
 
 # --- Run the serving benchmark sweep ---
-
-REQUEST_RATES=(1 2 4 8 16 32 inf)
+#
+# Sweep size is tuned for Polaris's 1h debug-scaling queue. At
+# NUM_PROMPTS=200, each config takes roughly:
+#   - request_rate=1:    ~200 s (prompt arrivals throttled to 1/s)
+#   - request_rate=8:    ~25 s
+#   - request_rate=inf:  ~15-30 s (saturated; bound by server throughput)
+# Three rates x two IO configs = 6 runs ~= 8-12 min total, including
+# brief per-config ramp-up. Expand on a longer-walltime queue.
+REQUEST_RATES=(1 8 inf)
 IO_CONFIGS=(
-	"128:128"
 	"512:128"
-	"1024:128"
 	"128:512"
-	"512:512"
 )
 
 echo ""
