@@ -663,6 +663,8 @@ echo "Exported RAY_ADDRESS=${RAY_ADDRESS} for vLLM subprocesses."
 echo ""
 echo "[Step 2/5] Starting Ray workers on ${#WORKER_HOSTS[@]} node(s): ${WORKER_HOSTS[*]}"
 
+print_process_diagnostics "head node start (pre-children ray start)"
+
 # Helper: launch a Ray worker on a remote node via mpiexec.
 # The worker runs with --block so the mpiexec session stays alive until Ray stops.
 launch_worker() {
@@ -779,7 +781,7 @@ echo "Worker mpiexec sessions launched (PIDs: ${WORKER_PIDS[*]})"
 echo ""
 echo "[Step 3/5] Waiting for ${EXPECTED_NODES} nodes (${EXPECTED_GPUS} GPUs) to join..."
 
-POLL_INTERVAL=5
+POLL_INTERVAL=10
 ELAPSED=0
 
 while true; do
