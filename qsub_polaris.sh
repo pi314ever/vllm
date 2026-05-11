@@ -185,6 +185,17 @@ unset _default_cvd
 # Benchmark output directory (under PBS job working directory)
 RESULTS_DIR="${RESULTS_DIR:-${PBS_O_WORKDIR:-.}/results_${PBS_JOBID:-manual}}"
 
+# Diagnostics subdirectory for per-phase, per-node thread/pid dumps.
+# Created early so the very first diagnostic call at job start
+# (before ray stop) has a place to write.
+DIAG_DIR="${RESULTS_DIR}/diagnostics"
+mkdir -p "${DIAG_DIR}"
+
+# Background-sampler kill-switch flag. The sampler loop (launched in
+# Step 4) runs while this file exists and exits cleanly when it is
+# removed by the cleanup / ERR trap or the normal end-of-step code.
+SAMPLER_FLAG="${DIAG_DIR}/.sampler_run"
+
 # Server port for online serving benchmark
 SERVE_PORT="${SERVE_PORT:-8000}"
 
@@ -465,6 +476,11 @@ cleanup() {
 	echo ""
 	echo "Cleaning up..."
 
+	# Stop the background sampler first so its final CSV rows land
+	# before the Ray teardown spins down the nodes. Safe to call even
+	# if the sampler was never started.
+	stop_background_sampler 2>/dev/null || true
+
 	# Kill the vLLM server if running
 	if [[ -n "${SERVER_PID}" ]]; then
 		echo "  Stopping vLLM server (PID ${SERVER_PID})..."
@@ -506,7 +522,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # =============================================================================
-# PROCESS-LIMIT DIAGNOSTICS (head node, read-only)
+# PROCESS-LIMIT DIAGNOSTICS (read-only)
 # =============================================================================
 # Captures the binding pids/threads limit shape at various points in the
 # job's lifecycle. Useful when workers are dying with EAGAIN-shaped errors
@@ -514,97 +530,567 @@ trap cleanup EXIT INT TERM
 # Everything here is read-only (ulimit reads, cat on /sys/fs/cgroup and
 # /proc, ps). No limits are ever raised.
 #
-# Called at:
-#   - job start (before ray head)
-#   - after the Ray cluster is fully ready (end of Step 3)
-#   - just before vllm serve (start of Step 5)
+# print_process_diagnostics runs on ONE host (the current one). Output is
+# emitted to stdout AND tee'd to ${DIAG_DIR}/<safe_label>_<hostname>.txt
+# so we can diff across phases and across nodes after the job finishes.
+#
+# print_process_diagnostics_all_nodes fans the single-node function out to
+# every node via mpiexec. Use this at phase boundaries; it's the only way
+# to see per-node thread pressure (the cgroup pids.max is per-node).
+#
+# Called at (via the all-nodes wrapper):
+#   - 00_job_start            (before ray stop / module load)
+#   - 01_pre_ray              (after env/module setup, before ray start)
+#   - 02_head_ray_up          (after head ray start, before workers join)
+#   - 03_cluster_ready        (end of Step 3, all nodes joined)
+#   - 04_pre_engine           (start of Step 4, immediately before vllm bench)
+#   - 05_pre_vllm_serve       (start of Step 5; only reached on success path)
+#   - FAILURE_rc<N>           (from the ERR trap on any command failure)
 print_process_diagnostics() {
 	local label="${1:-diagnostics}"
+	local hostname
+	hostname="$(hostname 2>/dev/null || echo unknown)"
 
-	echo ""
-	echo "=== Process limit diagnostics: ${label} (host $(hostname)) ==="
-
-	# ulimits
-	echo "  ulimit -u  (soft nproc): $(ulimit -u 2>/dev/null || echo unknown)"
-	echo "  ulimit -Hu (hard nproc): $(ulimit -Hu 2>/dev/null || echo unknown)"
-	echo "  ulimit -s  (stack KB):   $(ulimit -s 2>/dev/null || echo unknown)"
-
-	# Kernel-wide ceilings
-	if [[ -r /proc/sys/kernel/pid_max ]]; then
-		echo "  kernel pid_max:          $(cat /proc/sys/kernel/pid_max)"
-	fi
-	if [[ -r /proc/sys/kernel/threads-max ]]; then
-		echo "  kernel threads-max:      $(cat /proc/sys/kernel/threads-max)"
+	# Sanitize label for use as a filename component. Everything outside
+	# [A-Za-z0-9._-] collapses to '_' so labels like "FAILURE (rc=1)" and
+	# "cluster ready (post-Step 3)" become well-behaved file paths.
+	local safe_label
+	safe_label="$(printf '%s' "${label}" | tr -c '[:alnum:]._-' '_' | sed -E 's/_+/_/g; s/^_//; s/_$//')"
+	local out_file=""
+	if [[ -n "${DIAG_DIR:-}" && -d "${DIAG_DIR}" ]]; then
+		out_file="${DIAG_DIR}/${safe_label}_${hostname}.txt"
 	fi
 
-	# Find the actual cgroup pids.max for THIS process. PBS on Polaris
-	# puts each job in a per-job cgroup subtree, so the root
-	# /sys/fs/cgroup/pids.max (if it exists at all) is not the binding
-	# limit. Walk /proc/self/cgroup and look for the nearest pids.max.
-	local cgpath=""
-	if [[ -r /proc/self/cgroup ]]; then
-		# cgroup v2 line:  "0::/pbs_jobid/..."
-		# cgroup v1 pids:  "N:pids:/pbs_jobid/..."
-		cgpath="$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup)"
-		if [[ -z "${cgpath}" ]]; then
-			cgpath="$(awk -F: '$2 == "pids" {print $3; exit}' /proc/self/cgroup)"
+	# Emit to stdout and (if DIAG_DIR exists) also to the per-phase file.
+	# Using a group redirect with tee keeps the PBS .oe stream intact
+	# while producing per-node artifacts for offline analysis.
+	{
+		echo ""
+		echo "=== Process limit diagnostics: ${label} (host ${hostname}) ==="
+
+		# ulimits
+		echo "  ulimit -u  (soft nproc): $(ulimit -u 2>/dev/null || echo unknown)"
+		echo "  ulimit -Hu (hard nproc): $(ulimit -Hu 2>/dev/null || echo unknown)"
+		echo "  ulimit -s  (stack KB):   $(ulimit -s 2>/dev/null || echo unknown)"
+
+		# Kernel-wide ceilings
+		if [[ -r /proc/sys/kernel/pid_max ]]; then
+			echo "  kernel pid_max:          $(cat /proc/sys/kernel/pid_max)"
 		fi
-	fi
+		if [[ -r /proc/sys/kernel/threads-max ]]; then
+			echo "  kernel threads-max:      $(cat /proc/sys/kernel/threads-max)"
+		fi
 
-	local pids_max_file=""
-	local pids_cur_file=""
-	if [[ -n "${cgpath}" ]]; then
-		# Walk up the cgroup hierarchy looking for the nearest pids.max.
-		local probe="${cgpath}"
-		while true; do
-			if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
-				pids_max_file="/sys/fs/cgroup${probe}/pids.max"
-				pids_cur_file="/sys/fs/cgroup${probe}/pids.current"
-				break
+		# Find the actual cgroup pids.max for THIS process. PBS on Polaris
+		# puts each job in a per-job cgroup subtree, so the root
+		# /sys/fs/cgroup/pids.max (if it exists at all) is not the binding
+		# limit. Walk /proc/self/cgroup and look for the nearest pids.max.
+		local cgpath=""
+		if [[ -r /proc/self/cgroup ]]; then
+			# cgroup v2 line:  "0::/pbs_jobid/..."
+			# cgroup v1 pids:  "N:pids:/pbs_jobid/..."
+			cgpath="$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup)"
+			if [[ -z "${cgpath}" ]]; then
+				cgpath="$(awk -F: '$2 == "pids" {print $3; exit}' /proc/self/cgroup)"
 			fi
-			# cgroup v1 pids controller path
-			if [[ -r "/sys/fs/cgroup/pids${probe}/pids.max" ]]; then
-				pids_max_file="/sys/fs/cgroup/pids${probe}/pids.max"
-				pids_cur_file="/sys/fs/cgroup/pids${probe}/pids.current"
-				break
+		fi
+
+		local pids_max_file=""
+		local pids_cur_file=""
+		if [[ -n "${cgpath}" ]]; then
+			# Walk up the cgroup hierarchy looking for the nearest pids.max.
+			local probe="${cgpath}"
+			while true; do
+				if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
+					pids_max_file="/sys/fs/cgroup${probe}/pids.max"
+					pids_cur_file="/sys/fs/cgroup${probe}/pids.current"
+					break
+				fi
+				# cgroup v1 pids controller path
+				if [[ -r "/sys/fs/cgroup/pids${probe}/pids.max" ]]; then
+					pids_max_file="/sys/fs/cgroup/pids${probe}/pids.max"
+					pids_cur_file="/sys/fs/cgroup/pids${probe}/pids.current"
+					break
+				fi
+				if [[ -z "${probe}" || "${probe}" == "/" ]]; then
+					break
+				fi
+				probe="${probe%/*}"
+			done
+		fi
+		# Fallbacks to cgroup root if the walk failed.
+		if [[ -z "${pids_max_file}" ]]; then
+			if [[ -r /sys/fs/cgroup/pids.max ]]; then
+				pids_max_file="/sys/fs/cgroup/pids.max"
+				pids_cur_file="/sys/fs/cgroup/pids.current"
+			elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+				pids_max_file="/sys/fs/cgroup/pids/pids.max"
+				pids_cur_file="/sys/fs/cgroup/pids/pids.current"
 			fi
-			if [[ -z "${probe}" || "${probe}" == "/" ]]; then
-				break
-			fi
-			probe="${probe%/*}"
+		fi
+
+		local pids_max_val="unknown"
+		local pids_cur_val="unknown"
+		if [[ -n "${pids_max_file}" ]]; then
+			pids_max_val="$(cat "${pids_max_file}" 2>/dev/null || echo unknown)"
+			pids_cur_val="$(cat "${pids_cur_file}" 2>/dev/null || echo unknown)"
+			echo "  cgroup pids.max:         ${pids_max_val} (${pids_max_file})"
+			echo "  cgroup pids.current:     ${pids_cur_val}"
+		else
+			echo "  cgroup pids.max:         not found (cgpath='${cgpath:-none}')"
+		fi
+		if [[ -n "${cgpath}" ]]; then
+			echo "  /proc/self/cgroup path:  ${cgpath}"
+		fi
+
+		# Current usage by this user on this host.
+		local pid_count thread_count
+		pid_count="$(ps -u "${USER}" --no-headers 2>/dev/null | wc -l)"
+		# Per-thread listing (`ps -L`) counts each OS thread once.
+		thread_count="$(ps -u "${USER}" -L --no-headers 2>/dev/null | wc -l || echo unknown)"
+		echo "  pids (uid=${USER}):      ${pid_count}"
+		echo "  threads (uid=${USER}):   ${thread_count}"
+		echo "  nproc:                   $(nproc 2>/dev/null || echo unknown)"
+
+		# -----------------------------------------------------------------
+		# Ray component tally. Each bucket is a substring match against the
+		# full command line of every process owned by ${USER}. Matches are
+		# mutually non-exclusive at the regex level, but the Ray process
+		# names are distinctive enough that each bucket effectively counts
+		# one component. This block identifies whether the ~60-PID excess
+		# (observed: 86 PIDs at post-cluster-ready) is Ray idle-worker
+		# pre-spawn or something else entirely.
+		# -----------------------------------------------------------------
+		echo "  --- Ray component PID tally ---"
+		local ps_args_snapshot
+		ps_args_snapshot="$(ps -u "${USER}" -o pid,args --no-headers 2>/dev/null || true)"
+		local -a tally_patterns=(
+			"ray::IDLE"
+			"default_worker.py"
+			"raylet"
+			"gcs_server"
+			"plasma_store"
+			"log_monitor"
+			"dashboard_agent"
+			"runtime_env_agent"
+			"ray::"
+			"vllm"
+			"python"
+		)
+		local pat count
+		for pat in "${tally_patterns[@]}"; do
+			count="$(printf '%s\n' "${ps_args_snapshot}" | grep -Fc -- "${pat}" 2>/dev/null || true)"
+			# grep -c returns 0 matches as "0"; guard against empty on error.
+			count="${count:-0}"
+			printf "    %-24s %s\n" "${pat}" "${count}"
 		done
-	fi
-	# Fallbacks to cgroup root if the walk failed.
-	if [[ -z "${pids_max_file}" ]]; then
-		if [[ -r /sys/fs/cgroup/pids.max ]]; then
-			pids_max_file="/sys/fs/cgroup/pids.max"
-			pids_cur_file="/sys/fs/cgroup/pids.current"
-		elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
-			pids_max_file="/sys/fs/cgroup/pids/pids.max"
-			pids_cur_file="/sys/fs/cgroup/pids/pids.current"
+
+		# -----------------------------------------------------------------
+		# Top 40 processes by thread count (NLWP). This is the core
+		# per-process diagnostic: it identifies WHICH process owns the
+		# bulk of the threads at each phase, which no amount of env-var
+		# tuning can tell us. Read from top to bottom; the first few
+		# rows usually account for the majority of the budget.
+		#
+		# Columns: pid, nlwp (thread count), rss (KB), comm, args
+		# Sort: descending by nlwp (column 2 numeric).
+		# -----------------------------------------------------------------
+		echo "  --- Top 40 processes by thread count (pid nlwp rss comm args) ---"
+		ps -eLo pid,nlwp,rss,comm,args --no-headers -u "${USER}" 2>/dev/null |
+			awk '!seen[$1]++' |
+			sort -k2 -nr |
+			head -40 |
+			sed 's/^/    /'
+
+		# -----------------------------------------------------------------
+		# One-line summary for quick scanning across phases/nodes.
+		# Format designed for grep-ability.
+		# -----------------------------------------------------------------
+		local avg_threads="0"
+		if [[ "${pid_count}" -gt 0 ]] 2>/dev/null; then
+			avg_threads="$(awk -v t="${thread_count}" -v p="${pid_count}" 'BEGIN{if(p>0) printf "%.1f", t/p; else print "0"}')"
 		fi
-	fi
-
-	if [[ -n "${pids_max_file}" ]]; then
-		echo "  cgroup pids.max:         $(cat "${pids_max_file}" 2>/dev/null || echo unknown) (${pids_max_file})"
-		echo "  cgroup pids.current:     $(cat "${pids_cur_file}" 2>/dev/null || echo unknown)"
+		echo "  SUMMARY: label=${label} host=${hostname} pids=${pid_count} threads=${thread_count} avg=${avg_threads} cgroup_pids.current=${pids_cur_val}/${pids_max_val}"
+		echo "=============================================================="
+		echo ""
+	} 2>&1 | if [[ -n "${out_file}" ]]; then
+		tee -a "${out_file}"
 	else
-		echo "  cgroup pids.max:         not found (cgpath='${cgpath:-none}')"
+		cat
 	fi
-	if [[ -n "${cgpath}" ]]; then
-		echo "  /proc/self/cgroup path:  ${cgpath}"
+}
+
+# -----------------------------------------------------------------------------
+# print_process_diagnostics_all_nodes <label>
+# -----------------------------------------------------------------------------
+# Fans print_process_diagnostics out to every node in the allocation via
+# mpiexec. Each node writes its own ${DIAG_DIR}/<label>_<hostname>.txt and
+# tees to mpiexec's merged stdout. Falls back to single-node (head) mode if
+# node discovery hasn't run yet (e.g. very early in the script).
+#
+# The remote shell re-enters the current script so print_process_diagnostics
+# is in scope. We pass DIAG_DIR, USER, and the label through the environment
+# because they're needed inside the function.
+print_process_diagnostics_all_nodes() {
+	local label="${1:-all-nodes}"
+
+	# If node discovery hasn't completed yet (HEAD_HOST not set), fall
+	# back to a single-node call on the current host. This is safe for
+	# the very first "job start" snapshot that we may want to take
+	# before we've parsed PBS_NODEFILE.
+	if [[ -z "${HEAD_HOST:-}" ]]; then
+		print_process_diagnostics "${label}"
+		return 0
 	fi
 
-	# Current usage by this user on this host.
-	echo "  pids (uid=${USER}):      $(ps -u "${USER}" --no-headers 2>/dev/null | wc -l)"
-	# Per-thread listing (`ps -L`) counts each OS thread once.
-	local thread_count
-	thread_count="$(ps -u "${USER}" -L --no-headers 2>/dev/null | wc -l || echo unknown)"
-	echo "  threads (uid=${USER}):   ${thread_count}"
-	echo "  nproc:                   $(nproc 2>/dev/null || echo unknown)"
-	echo "=============================================================="
-	echo ""
+	# Build the comma-separated host list. PBS runs the script on the
+	# head, so HEAD_HOST is always in the list.
+	local hosts="${HEAD_HOST}"
+	local h
+	for h in "${WORKER_HOSTS[@]:-}"; do
+		if [[ -n "${h}" ]]; then
+			hosts+=",${h}"
+		fi
+	done
+
+	local n_hosts
+	n_hosts="$(awk -F, '{print NF}' <<<"${hosts}")"
+
+	# Remote command: source env, activate venv, re-source this very
+	# script in "functions-only" mode by marking DIAG_SOURCE_ONLY=1 and
+	# having the top of the script early-exit when it's set. Simpler
+	# alternative: inline the minimal subset needed by
+	# print_process_diagnostics. We pick the inline approach to avoid
+	# re-sourcing the whole qsub script (which would re-run `ray stop`
+	# etc. with disastrous consequences).
+	#
+	# The remote bash -c receives:
+	#   - DIAG_DIR (shared /grand path, visible from all nodes)
+	#   - label, USER
+	# and re-defines a slim version of the diagnostic function inline.
+	# This duplicates code, but keeps the remote call hermetic and avoids
+	# any chance of accidentally re-executing the driver script.
+	#
+	# NOTE on quoting: we build the remote snippet with printf %q for the
+	# label so spaces/parens in labels ("cluster ready (post-Step 3)")
+	# survive the mpiexec bash -c round-trip.
+	local q_label q_diag_dir q_user
+	q_label="$(printf '%q' "${label}")"
+	q_diag_dir="$(printf '%q' "${DIAG_DIR}")"
+	q_user="$(printf '%q' "${USER}")"
+
+	# shellcheck disable=SC2016  # single quotes intentional; vars are
+	# expanded in the outer shell via the concatenation below.
+	local remote_script='
+export DIAG_DIR='"${q_diag_dir}"'
+export USER='"${q_user}"'
+export REMOTE_LABEL='"${q_label}"'
+# Re-define print_process_diagnostics locally. This is a minimal copy
+# of the driver-script function, kept in sync manually. If you update
+# the driver-side function signature/output format, update this copy
+# too or the per-node files will diverge.
+print_process_diagnostics() {
+	local label="${1:-diagnostics}"
+	local hostname
+	hostname="$(hostname 2>/dev/null || echo unknown)"
+	local safe_label
+	safe_label="$(printf "%s" "${label}" | tr -c "[:alnum:]._-" "_" | sed -E "s/_+/_/g; s/^_//; s/_$//")"
+	local out_file=""
+	if [[ -n "${DIAG_DIR:-}" && -d "${DIAG_DIR}" ]]; then
+		out_file="${DIAG_DIR}/${safe_label}_${hostname}.txt"
+	fi
+	{
+		echo ""
+		echo "=== Process limit diagnostics: ${label} (host ${hostname}) ==="
+		echo "  ulimit -u  (soft nproc): $(ulimit -u 2>/dev/null || echo unknown)"
+		echo "  ulimit -Hu (hard nproc): $(ulimit -Hu 2>/dev/null || echo unknown)"
+		echo "  ulimit -s  (stack KB):   $(ulimit -s 2>/dev/null || echo unknown)"
+		if [[ -r /proc/sys/kernel/pid_max ]]; then
+			echo "  kernel pid_max:          $(cat /proc/sys/kernel/pid_max)"
+		fi
+		if [[ -r /proc/sys/kernel/threads-max ]]; then
+			echo "  kernel threads-max:      $(cat /proc/sys/kernel/threads-max)"
+		fi
+		local cgpath=""
+		if [[ -r /proc/self/cgroup ]]; then
+			cgpath="$(awk -F: "\$1 == \"0\" {print \$3; exit}" /proc/self/cgroup)"
+			if [[ -z "${cgpath}" ]]; then
+				cgpath="$(awk -F: "\$2 == \"pids\" {print \$3; exit}" /proc/self/cgroup)"
+			fi
+		fi
+		local pids_max_file="" pids_cur_file=""
+		if [[ -n "${cgpath}" ]]; then
+			local probe="${cgpath}"
+			while true; do
+				if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
+					pids_max_file="/sys/fs/cgroup${probe}/pids.max"
+					pids_cur_file="/sys/fs/cgroup${probe}/pids.current"
+					break
+				fi
+				if [[ -r "/sys/fs/cgroup/pids${probe}/pids.max" ]]; then
+					pids_max_file="/sys/fs/cgroup/pids${probe}/pids.max"
+					pids_cur_file="/sys/fs/cgroup/pids${probe}/pids.current"
+					break
+				fi
+				if [[ -z "${probe}" || "${probe}" == "/" ]]; then break; fi
+				probe="${probe%/*}"
+			done
+		fi
+		if [[ -z "${pids_max_file}" ]]; then
+			if [[ -r /sys/fs/cgroup/pids.max ]]; then
+				pids_max_file="/sys/fs/cgroup/pids.max"
+				pids_cur_file="/sys/fs/cgroup/pids.current"
+			elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+				pids_max_file="/sys/fs/cgroup/pids/pids.max"
+				pids_cur_file="/sys/fs/cgroup/pids/pids.current"
+			fi
+		fi
+		local pids_max_val="unknown" pids_cur_val="unknown"
+		if [[ -n "${pids_max_file}" ]]; then
+			pids_max_val="$(cat "${pids_max_file}" 2>/dev/null || echo unknown)"
+			pids_cur_val="$(cat "${pids_cur_file}" 2>/dev/null || echo unknown)"
+			echo "  cgroup pids.max:         ${pids_max_val} (${pids_max_file})"
+			echo "  cgroup pids.current:     ${pids_cur_val}"
+		else
+			echo "  cgroup pids.max:         not found (cgpath=${cgpath:-none})"
+		fi
+		if [[ -n "${cgpath}" ]]; then
+			echo "  /proc/self/cgroup path:  ${cgpath}"
+		fi
+		local pid_count thread_count
+		pid_count="$(ps -u "${USER}" --no-headers 2>/dev/null | wc -l)"
+		thread_count="$(ps -u "${USER}" -L --no-headers 2>/dev/null | wc -l || echo unknown)"
+		echo "  pids (uid=${USER}):      ${pid_count}"
+		echo "  threads (uid=${USER}):   ${thread_count}"
+		echo "  nproc:                   $(nproc 2>/dev/null || echo unknown)"
+		echo "  --- Ray component PID tally ---"
+		local ps_args_snapshot
+		ps_args_snapshot="$(ps -u "${USER}" -o pid,args --no-headers 2>/dev/null || true)"
+		local tally_patterns=(ray::IDLE default_worker.py raylet gcs_server plasma_store log_monitor dashboard_agent runtime_env_agent "ray::" vllm python)
+		local pat count
+		for pat in "${tally_patterns[@]}"; do
+			count="$(printf "%s\n" "${ps_args_snapshot}" | grep -Fc -- "${pat}" 2>/dev/null || true)"
+			count="${count:-0}"
+			printf "    %-24s %s\n" "${pat}" "${count}"
+		done
+		echo "  --- Top 40 processes by thread count (pid nlwp rss comm args) ---"
+		ps -eLo pid,nlwp,rss,comm,args --no-headers -u "${USER}" 2>/dev/null | awk "!seen[\$1]++" | sort -k2 -nr | head -40 | sed "s/^/    /"
+		local avg_threads="0"
+		if [[ "${pid_count}" -gt 0 ]] 2>/dev/null; then
+			avg_threads="$(awk -v t="${thread_count}" -v p="${pid_count}" "BEGIN{if(p>0) printf \"%.1f\", t/p; else print \"0\"}")"
+		fi
+		echo "  SUMMARY: label=${label} host=${hostname} pids=${pid_count} threads=${thread_count} avg=${avg_threads} cgroup_pids.current=${pids_cur_val}/${pids_max_val}"
+		echo "=============================================================="
+		echo ""
+	} 2>&1 | if [[ -n "${out_file}" ]]; then tee -a "${out_file}"; else cat; fi
 }
+print_process_diagnostics "${REMOTE_LABEL}"
+'
+
+	# Run on all nodes in parallel. --ppn 1 ensures one invocation per
+	# host. Any node that fails its diagnostic (e.g. missing /proc paths
+	# or hostname resolution errors) is logged but does not fail the
+	# main job: we wrap with `|| true` so missing data on one node does
+	# not mask the data we do get from the others.
+	mpiexec -n "${n_hosts}" --ppn 1 --hosts "${hosts}" -- bash -c "${remote_script}" 2>&1 || true
+}
+
+# =============================================================================
+# BACKGROUND THREAD/PID SAMPLER
+# =============================================================================
+# Samples pids.current (from the cgroup file resolved on each node) and
+# thread counts every 2 seconds, per node, for the duration of the
+# engine-init / benchmark phase. Writes CSV rows to
+# ${DIAG_DIR}/sampler_<hostname>.csv so we can reconstruct the *trajectory*
+# of thread growth during the engine startup that currently dies with
+# "Resource temporarily unavailable".
+#
+# Lifecycle:
+#   - start_background_sampler    : called at the start of Step 4
+#   - stop_background_sampler     : called on success, on ERR trap, and
+#                                   from cleanup() as a final belt-and-
+#                                   suspenders guarantee.
+#
+# Control mechanism: a shared flag file (${SAMPLER_FLAG}) sitting on the
+# shared /grand filesystem, visible from every node. The remote loops
+# exit when the flag disappears. This avoids the need to track remote
+# PIDs across mpiexec sessions.
+
+SAMPLER_MPIEXEC_PID=""
+
+start_background_sampler() {
+	# No-op if the sampler is already running.
+	if [[ -n "${SAMPLER_MPIEXEC_PID}" ]] && kill -0 "${SAMPLER_MPIEXEC_PID}" 2>/dev/null; then
+		return 0
+	fi
+
+	# Drop the control flag so remote loops see it at startup.
+	: >"${SAMPLER_FLAG}"
+
+	# Require HEAD_HOST / WORKER_HOSTS to have been populated by node
+	# discovery; otherwise we'd sample only the head and silently miss
+	# the workers.
+	if [[ -z "${HEAD_HOST:-}" ]]; then
+		echo "WARN: start_background_sampler called before node discovery; head-only."
+	fi
+
+	local hosts="${HEAD_HOST}"
+	local h
+	for h in "${WORKER_HOSTS[@]:-}"; do
+		if [[ -n "${h}" ]]; then
+			hosts+=",${h}"
+		fi
+	done
+	local n_hosts
+	n_hosts="$(awk -F, '{print NF}' <<<"${hosts}")"
+
+	# Remote loop: every 2s, append a CSV row with
+	#   epoch,hostname,pid_count,thread_count,cgroup_pids_current,cgroup_pids_max,ray_idle,ray_total
+	# while the flag file exists. Exits cleanly when the flag is removed.
+	# Inline cgroup resolution (duplicated from print_process_diagnostics)
+	# so the loop body is self-contained.
+	local q_diag_dir q_user q_flag
+	q_diag_dir="$(printf '%q' "${DIAG_DIR}")"
+	q_user="$(printf '%q' "${USER}")"
+	q_flag="$(printf '%q' "${SAMPLER_FLAG}")"
+
+	local remote_script='
+export DIAG_DIR='"${q_diag_dir}"'
+export USER='"${q_user}"'
+export FLAG='"${q_flag}"'
+hostname="$(hostname 2>/dev/null || echo unknown)"
+out="${DIAG_DIR}/sampler_${hostname}.csv"
+
+# Resolve the binding cgroup pids.max / pids.current files once.
+cgpath=""
+if [[ -r /proc/self/cgroup ]]; then
+	cgpath="$(awk -F: "\$1 == \"0\" {print \$3; exit}" /proc/self/cgroup)"
+	if [[ -z "${cgpath}" ]]; then
+		cgpath="$(awk -F: "\$2 == \"pids\" {print \$3; exit}" /proc/self/cgroup)"
+	fi
+fi
+pids_max_file=""
+pids_cur_file=""
+if [[ -n "${cgpath}" ]]; then
+	probe="${cgpath}"
+	while true; do
+		if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
+			pids_max_file="/sys/fs/cgroup${probe}/pids.max"
+			pids_cur_file="/sys/fs/cgroup${probe}/pids.current"
+			break
+		fi
+		if [[ -r "/sys/fs/cgroup/pids${probe}/pids.max" ]]; then
+			pids_max_file="/sys/fs/cgroup/pids${probe}/pids.max"
+			pids_cur_file="/sys/fs/cgroup/pids${probe}/pids.current"
+			break
+		fi
+		if [[ -z "${probe}" || "${probe}" == "/" ]]; then break; fi
+		probe="${probe%/*}"
+	done
+fi
+if [[ -z "${pids_max_file}" ]]; then
+	if [[ -r /sys/fs/cgroup/pids.max ]]; then
+		pids_max_file="/sys/fs/cgroup/pids.max"
+		pids_cur_file="/sys/fs/cgroup/pids.current"
+	elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+		pids_max_file="/sys/fs/cgroup/pids/pids.max"
+		pids_cur_file="/sys/fs/cgroup/pids/pids.current"
+	fi
+fi
+
+# Header (written once; append-safe across re-entries).
+if [[ ! -s "${out}" ]]; then
+	echo "epoch,hostname,pid_count,thread_count,pids_current,pids_max,ray_idle,ray_total" >"${out}"
+fi
+
+# Sample loop. 2s cadence; exits when flag disappears or after a hard
+# ceiling of 3h (safety cap in case the flag file gets stranded).
+deadline=$(( $(date +%s) + 10800 ))
+while [[ -e "${FLAG}" ]]; do
+	now=$(date +%s)
+	if (( now > deadline )); then break; fi
+	pid_count="$(ps -u "${USER}" --no-headers 2>/dev/null | wc -l)"
+	thread_count="$(ps -u "${USER}" -L --no-headers 2>/dev/null | wc -l)"
+	cur="unknown"; max="unknown"
+	if [[ -n "${pids_cur_file}" ]]; then
+		cur="$(cat "${pids_cur_file}" 2>/dev/null || echo unknown)"
+		max="$(cat "${pids_max_file}" 2>/dev/null || echo unknown)"
+	fi
+	ps_snap="$(ps -u "${USER}" -o args --no-headers 2>/dev/null || true)"
+	ray_idle="$(printf "%s\n" "${ps_snap}" | grep -Fc -- "ray::IDLE" 2>/dev/null || true)"
+	ray_idle="${ray_idle:-0}"
+	ray_total="$(printf "%s\n" "${ps_snap}" | grep -Fc -- "ray::" 2>/dev/null || true)"
+	ray_total="${ray_total:-0}"
+	echo "${now},${hostname},${pid_count},${thread_count},${cur},${max},${ray_idle},${ray_total}" >>"${out}"
+	sleep 2
+done
+'
+
+	# Launch the mpiexec in background; track its PID so we can wait on
+	# it in stop_background_sampler. Output goes to /dev/null because the
+	# useful data lands in the per-node CSVs.
+	mpiexec -n "${n_hosts}" --ppn 1 --hosts "${hosts}" -- bash -c "${remote_script}" \
+		>/dev/null 2>&1 &
+	SAMPLER_MPIEXEC_PID=$!
+	echo "Background thread/pid sampler started (mpiexec PID ${SAMPLER_MPIEXEC_PID}, hosts: ${hosts})"
+}
+
+stop_background_sampler() {
+	# Idempotent: safe to call multiple times (normal exit + cleanup trap
+	# + ERR trap all call it).
+	if [[ ! -e "${SAMPLER_FLAG}" ]] && [[ -z "${SAMPLER_MPIEXEC_PID}" ]]; then
+		return 0
+	fi
+	# Remove the flag so remote loops exit on their next iteration
+	# (within 2s). This is the clean shutdown path.
+	rm -f "${SAMPLER_FLAG}" 2>/dev/null || true
+
+	if [[ -n "${SAMPLER_MPIEXEC_PID}" ]]; then
+		# Wait up to 5s for graceful exit, then force-kill the mpiexec.
+		local waited=0
+		while [[ "${waited}" -lt 5 ]] && kill -0 "${SAMPLER_MPIEXEC_PID}" 2>/dev/null; do
+			sleep 1
+			waited=$((waited + 1))
+		done
+		if kill -0 "${SAMPLER_MPIEXEC_PID}" 2>/dev/null; then
+			kill "${SAMPLER_MPIEXEC_PID}" 2>/dev/null || true
+			wait "${SAMPLER_MPIEXEC_PID}" 2>/dev/null || true
+		fi
+		SAMPLER_MPIEXEC_PID=""
+	fi
+}
+
+# =============================================================================
+# ERR TRAP (failure-time diagnostic dump)
+# =============================================================================
+# When any command in the driver script exits non-zero under `set -e`, this
+# trap fires, dumps the per-process thread state on every node, stops the
+# background sampler so its final CSV rows flush to disk, then returns the
+# original exit code so the `set -e` unwind continues normally.
+#
+# This is the single most valuable data point for the current failure mode:
+# the thread budget is hit during engine init, and we want to see *which*
+# process was fattest at the moment of death, on every node.
+
+_diag_on_err() {
+	local rc=$?
+	echo ""
+	echo "!!! ERR trap: command failed with rc=${rc} at line ${BASH_LINENO[0]}"
+
+	# Dump per-node diagnostics. Guard against recursion: if the
+	# diagnostic itself fails (e.g. mpiexec is down), we swallow the
+	# error to preserve the original rc.
+	print_process_diagnostics_all_nodes "FAILURE_rc${rc}" || true
+
+	# Flush sampler CSVs before we unwind.
+	stop_background_sampler || true
+
+	# Preserve the original exit code. With `set -e`, the script will
+	# now unwind via the EXIT trap (cleanup).
+	return "${rc}"
+}
+
+trap _diag_on_err ERR
 
 # =============================================================================
 # STEP 1: Start Ray Head Node (on this node)
@@ -625,10 +1111,20 @@ export VLLM_HOST_IP="${HEAD_IP}"
 # old block only checked the cgroup root, while PBS on Polaris places
 # each job in a per-job subtree under /sys/fs/cgroup/. The function
 # below walks /proc/self/cgroup to find the binding pids.max.
-print_process_diagnostics "job start (pre-Ray)"
+#
+# 00_job_start: snapshot taken BEFORE `ray stop --force` runs, so we
+# capture any leaked processes from prior jobs on each compute node.
+# User asserts Polaris reallocates nodes per job (so this should be
+# empty of Ray/vLLM processes), but verifying is free.
+print_process_diagnostics_all_nodes "00_job_start"
 
 ray stop --force 2>/dev/null || true
 sleep 2
+
+# 01_pre_ray: snapshot AFTER ray stop / module load / venv activation,
+# immediately before we bring the new Ray head up. Baseline: everything
+# before our new Ray cluster exists.
+print_process_diagnostics_all_nodes "01_pre_ray"
 
 # Dashboard is disabled to reduce thread count under Polaris's cgroup
 # pids.max=4096 cap. The dashboard aiohttp server + its per-node agent
@@ -663,7 +1159,11 @@ echo "Exported RAY_ADDRESS=${RAY_ADDRESS} for vLLM subprocesses."
 echo ""
 echo "[Step 2/5] Starting Ray workers on ${#WORKER_HOSTS[@]} node(s): ${WORKER_HOSTS[*]}"
 
-print_process_diagnostics "head node start (pre-children ray start)"
+# 02_head_ray_up: snapshot AFTER the head-node ray start completes but
+# BEFORE any worker joins. Isolates the head-only Ray infrastructure
+# overhead (raylet + gcs_server + object store + log monitor + any
+# pre-spawned idle Python workers). Workers show baseline state.
+print_process_diagnostics_all_nodes "02_head_ray_up"
 
 # Helper: launch a Ray worker on a remote node via mpiexec.
 # The worker runs with --block so the mpiexec session stays alive until Ray stops.
@@ -819,7 +1319,7 @@ done
 # this snapshot is already near cgroup pids.max, we know the vLLM engine
 # startup cannot possibly succeed and we should bail before wasting GPU
 # time on a run that's going to die in pthread_create.
-print_process_diagnostics "cluster ready (post-Step 3)"
+print_process_diagnostics_all_nodes "03_cluster_ready"
 
 # =============================================================================
 # STEP 4: Run Offline Latency Benchmarks
@@ -876,6 +1376,18 @@ OUTPUT_LEN=128
 LATENCY_WARMUP_ITERS="${LATENCY_WARMUP_ITERS:-2}"
 LATENCY_ITERS="${LATENCY_ITERS:-10}"
 
+# 04_pre_engine: snapshot immediately before the first vllm bench
+# launches the engine. If the engine init dies (as it has been doing),
+# this is the last clean "before" state we can compare the FAILURE
+# snapshot against to see exactly which process ballooned.
+print_process_diagnostics_all_nodes "04_pre_engine"
+
+# Kick off the continuous 2s sampler on every node. It writes
+# ${DIAG_DIR}/sampler_<hostname>.csv and is torn down by the ERR trap,
+# by the EXIT/cleanup trap, or by the explicit stop_background_sampler
+# call at the end of this step.
+start_background_sampler
+
 for INPUT_LEN in "${INPUT_LENS[@]}"; do
 	for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
 		RESULT_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.json"
@@ -901,18 +1413,18 @@ done
 echo "Offline latency benchmarks complete."
 echo ""
 
-# =============================================================================
-# STEP 5: Online Serving Benchmark
-# =============================================================================
-
-echo "[Step 5/5] Starting vLLM server and running serving benchmarks..."
-
 # Snapshot just before vllm serve. Between Step 4 (offline latency) and
 # here, the offline engine has torn itself down but some processes may
 # linger briefly. If pids.current is close to pids.max at this point,
 # the `vllm serve` subprocess tree below is likely to fail in the same
 # zmq pthread_create path we've hit before.
-print_process_diagnostics "pre-vllm-serve (Step 5 start)"
+print_process_diagnostics_all_nodes "05_pre_vllm_serve"
+
+# =============================================================================
+# STEP 5: Online Serving Benchmark
+# =============================================================================
+
+echo "[Step 5/5] Starting vLLM server and running serving benchmarks..."
 
 # Start the vLLM server in the background.
 # Use a process group so we can cleanly kill the server and its children.
