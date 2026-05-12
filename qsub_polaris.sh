@@ -160,6 +160,23 @@ EXPECTED_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 EP_SIZE="${TP_SIZE}" # derived; only valid while DP=1
 RAY_CLUSTER_TIMEOUT="${RAY_CLUSTER_TIMEOUT:-600}" # seconds
 
+# Ray CPU slots per node. This caps Ray's idle-worker pre-spawn pool,
+# which is the single largest consumer of PBS cgroup pids budget on
+# Polaris. See the "RAY IDLE WORKER POOL LIMIT" block below for the
+# full rationale. TL;DR: raylet defaults --maximum_startup_concurrency
+# from `ncpus`, which on Polaris is 32 (physical) or 64 (SMT), and
+# then pre-spawns up to 64 `ray::IDLE` Python workers per node. At
+# ~48 threads each that is ~3000 threads of dead weight inside the
+# 4096 pids.max cap, leaving the vLLM engine <600 threads of headroom
+# before CUDA graph capture / Triton JIT / lazy NCCL P2P blows past
+# the limit with EAGAIN on pthread_create. Setting --num-cpus to a
+# small value (matching GPUS_PER_NODE) reduces the idle pool to a
+# handful of workers. vLLM's Ray placement-group bundles request
+# `{"GPU": 1.0}` only (see vllm/v1/executor/ray_utils.py:635), and
+# worker remote kwargs use num_cpus=0 (ray_executor_v2.py:344), so
+# reducing --num-cpus does NOT interfere with vLLM scheduling.
+NUM_RAY_CPUS_PER_NODE="${NUM_RAY_CPUS_PER_NODE:-${GPUS_PER_NODE}}"
+
 # Sanity check: total GPU count must match PP * TP.
 if (( PP_SIZE * TP_SIZE != EXPECTED_GPUS )); then
 	echo "ERROR: Invalid parallelism configuration."
@@ -182,8 +199,44 @@ _default_cvd="$(seq -s, 0 $((GPUS_PER_NODE - 1)))"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${_default_cvd}}"
 unset _default_cvd
 
-# Benchmark output directory (under PBS job working directory)
-RESULTS_DIR="${RESULTS_DIR:-${PBS_O_WORKDIR:-.}/results_${PBS_JOBID:-manual}}"
+# Short, filesystem-friendly PBS job id (no host suffix). Used as the
+# unique per-run namespace component below. For manual / no-PBS runs
+# this falls back to "manual". Exported so remote mpiexec subshells
+# (diagnostics, sampler) can read it for cgroup resolution without
+# re-parsing $PBS_JOBID.
+PBS_SHORT_JOBID="${PBS_JOBID%%.*}"
+PBS_SHORT_JOBID="${PBS_SHORT_JOBID:-manual}"
+export PBS_SHORT_JOBID
+
+# Per-run log/output namespace.
+#   logs/<job_name>/run.log         -> all stdout/stderr from this script
+#   logs/<job_name>/results/        -> RESULTS_DIR (benchmark outputs + diag)
+#
+# <job_name> = "${PBS_JOBNAME}.o${PBS_SHORT_JOBID}", matching PBS's own
+# default output file convention (<jobname>.o<jobid>) so a user scanning
+# `ls logs/` can correlate with the PBS job list easily while still
+# getting per-run history (no cross-run overwrites).
+JOB_NAME="${JOB_NAME:-${PBS_JOBNAME:-vllm-bench}.o${PBS_SHORT_JOBID}}"
+RUN_LOG_DIR="${RUN_LOG_DIR:-${PBS_O_WORKDIR:-.}/logs/${JOB_NAME}}"
+mkdir -p "${RUN_LOG_DIR}"
+
+# Tee every byte written from this point forward to run.log. PBS still
+# maintains its own <jobname>.o<jobid> spool file in PBS_O_WORKDIR
+# (redundant but harmless backup; users can ignore it).
+#
+# Using `exec > >(tee ...)` with `set -e` works fine: the tee runs in
+# a background process-substitution subshell, and bash's signal /
+# pipefail handling is unaffected. The cleanup trap kills the
+# explicitly-tracked worker / sampler PIDs; the tee process exits
+# naturally when its stdin closes at end-of-script.
+RUN_LOG_FILE="${RUN_LOG_DIR}/run.log"
+exec > >(tee -a "${RUN_LOG_FILE}") 2>&1
+echo "Run log teeing to: ${RUN_LOG_FILE}"
+
+# Benchmark output directory. Nested under ${RUN_LOG_DIR} so all
+# per-run artifacts (run.log, results/, diagnostics/) live in one
+# namespace. Override RESULTS_DIR at submission time to decouple.
+RESULTS_DIR="${RESULTS_DIR:-${RUN_LOG_DIR}/results}"
 
 # Diagnostics subdirectory for per-phase, per-node thread/pid dumps.
 # Created early so the very first diagnostic call at job start
@@ -365,6 +418,73 @@ export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export DO_NOT_TRACK="${DO_NOT_TRACK:-1}"
 
 # =============================================================================
+# RAY IDLE WORKER POOL LIMIT
+# =============================================================================
+# Ray's raylet pre-spawns a pool of idle Python workers per node. The size
+# of that pool is driven by `ray start --num-cpus` (or, if unset, the
+# raylet's auto-discovered CPU count via Ray's `--maximum_startup_concurrency`
+# which defaults to 2x physical cores on Polaris -> 64). Once vLLM's
+# placement-group request fires during engine init, Ray balloons the
+# idle pool to match `num_cpus`, and each `ray::IDLE` Python worker
+# carries ~48 threads (torch + CUDA context + Ray internal pools). On
+# a 6-node run with pids.max=4096 per job cgroup, this chews up ~3500
+# of 4096 pids per node BEFORE the engine starts any compute, leaving
+# <600 threads of headroom for CUDA graph capture, Triton JIT
+# (gcc+ld forks), and lazy 2-rank NCCL subcomm creation from
+# unbatched PP P2P ops. The result is EAGAIN on pthread_create at
+# first forward pass, worker death, and a 30-min downstream gloo
+# recv timeout.
+#
+# Setting RAY_num_workers_soft_limit caps the soft limit of idle
+# Python workers Ray maintains, independent of --num-cpus. With
+# both knobs set, the idle pool stabilizes at ~NUM_RAY_CPUS_PER_NODE
+# workers per node -- saving ~2800 threads per node at the DeepSeek
+# scale above.
+export RAY_num_workers_soft_limit="${RAY_num_workers_soft_limit:-${NUM_RAY_CPUS_PER_NODE}}"
+
+# =============================================================================
+# PYTORCH NCCL PER-PG THREAD MINIMIZATION
+# =============================================================================
+# vLLM's isend_tensor_dict / irecv_tensor_dict (parallel_state.py:899,1002)
+# calls torch.distributed.isend/irecv directly on the PP device_group
+# (NCCL, size=PP_SIZE) -- it does NOT route through pynccl for CUDA
+# PP tensors. In PyTorch's default lazy-init mode, each unique
+# (src, dst) pair inside a size-N NCCL ProcessGroup causes a NEW
+# 2-rank NCCL subcommunicator to be created on first use
+# ("An unbatched P2P op (send/recv) was called on this ProcessGroup
+# with size N. In lazy initialization mode, this will result in a
+# new 2-rank NCCL communicator to be created."). Each new subcomm
+# spawns:
+#   1. a ProcessGroupNCCL watchdog thread,
+#   2. a NCCL proxy / service thread (libnccl),
+#   3. a heartbeat monitor thread (TORCH_NCCL_ENABLE_MONITORING, on
+#      by default),
+#   4. optional trace-dump threads.
+#
+# At PP=6, TP=4 there are up to 5 send pairs x 4 TP ranks = 20 new
+# 2-rank subcomms cluster-wide, each adding ~3 threads -> ~60 extra
+# threads cluster-wide, ~10/node, appearing AT first forward pass
+# (CUDA graph capture + Triton JIT) when the thread budget is
+# already most strained.
+#
+# We cannot disable the watchdog (#1) -- it's required for error
+# propagation. We can turn off #3 and #4, which are telemetry-only:
+#   - TORCH_NCCL_ENABLE_MONITORING=0 : disables heartbeat monitor
+#     thread. No correctness impact; only disables PyTorch's passive
+#     NCCL hang-detection telemetry.
+#   - TORCH_NCCL_TRACE_BUFFER_SIZE=0 : already default on recent
+#     torch, set explicitly to suppress any trace-capture thread.
+#   - TORCH_NCCL_DUMP_ON_TIMEOUT=0   : belt-and-suspenders against
+#     any trace-dump-on-timeout worker.
+#
+# NOT setting TORCH_NCCL_ASYNC_ERROR_HANDLING -- leaving it at the
+# PyTorch default so NCCL errors still surface as Python exceptions
+# (vs. silent deadlocks).
+export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-0}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-0}"
+
+# =============================================================================
 # NODE DISCOVERY FROM PBS
 # =============================================================================
 
@@ -460,7 +580,9 @@ echo "  EP size:        ${EP_SIZE} (derived: TP * DP, DP=1)"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
 echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
+echo "  Ray CPUs/node:  ${NUM_RAY_CPUS_PER_NODE} (caps ray::IDLE pool)"
 echo "  Cache root:     ${CACHE_ROOT}"
+echo "  Run log:        ${RUN_LOG_FILE}"
 echo "  Results dir:    ${RESULTS_DIR}"
 echo "============================================="
 
@@ -584,7 +706,22 @@ print_process_diagnostics() {
 		# Find the actual cgroup pids.max for THIS process. PBS on Polaris
 		# puts each job in a per-job cgroup subtree, so the root
 		# /sys/fs/cgroup/pids.max (if it exists at all) is not the binding
-		# limit. Walk /proc/self/cgroup and look for the nearest pids.max.
+		# limit.
+		#
+		# Polaris-specific fast path: the binding cgroup is
+		# /sys/fs/cgroup/jobs/<short_jobid>/. Try this path FIRST because
+		# the /proc/self/cgroup walk below can land in a sibling cgroup
+		# (e.g. palsd.service under nested mpiexec) whose pids.max reads
+		# "max" -- yielding a misleading diagnostic even when the binding
+		# cap is 4096. If the Polaris path is unreadable, fall through
+		# to the generic walk for portability.
+		local pids_max_file=""
+		local pids_cur_file=""
+		if [[ -n "${PBS_SHORT_JOBID:-}" && -r "/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max" ]]; then
+			pids_max_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max"
+			pids_cur_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.current"
+		fi
+
 		local cgpath=""
 		if [[ -r /proc/self/cgroup ]]; then
 			# cgroup v2 line:  "0::/pbs_jobid/..."
@@ -595,9 +732,7 @@ print_process_diagnostics() {
 			fi
 		fi
 
-		local pids_max_file=""
-		local pids_cur_file=""
-		if [[ -n "${cgpath}" ]]; then
+		if [[ -z "${pids_max_file}" && -n "${cgpath}" ]]; then
 			# Walk up the cgroup hierarchy looking for the nearest pids.max.
 			local probe="${cgpath}"
 			while true; do
@@ -774,10 +909,11 @@ print_process_diagnostics_all_nodes() {
 	# NOTE on quoting: we build the remote snippet with printf %q for the
 	# label so spaces/parens in labels ("cluster ready (post-Step 3)")
 	# survive the mpiexec bash -c round-trip.
-	local q_label q_diag_dir q_user
+	local q_label q_diag_dir q_user q_short_jobid
 	q_label="$(printf '%q' "${label}")"
 	q_diag_dir="$(printf '%q' "${DIAG_DIR}")"
 	q_user="$(printf '%q' "${USER}")"
+	q_short_jobid="$(printf '%q' "${PBS_SHORT_JOBID:-}")"
 
 	# shellcheck disable=SC2016  # single quotes intentional; vars are
 	# expanded in the outer shell via the concatenation below.
@@ -785,6 +921,7 @@ print_process_diagnostics_all_nodes() {
 export DIAG_DIR='"${q_diag_dir}"'
 export USER='"${q_user}"'
 export REMOTE_LABEL='"${q_label}"'
+export PBS_SHORT_JOBID='"${q_short_jobid}"'
 # Re-define print_process_diagnostics locally. This is a minimal copy
 # of the driver-script function, kept in sync manually. If you update
 # the driver-side function signature/output format, update this copy
@@ -811,6 +948,15 @@ print_process_diagnostics() {
 		if [[ -r /proc/sys/kernel/threads-max ]]; then
 			echo "  kernel threads-max:      $(cat /proc/sys/kernel/threads-max)"
 		fi
+		# Polaris-specific fast path: the binding cgroup is
+		# /sys/fs/cgroup/jobs/<short_jobid>/. Try this path FIRST because
+		# the /proc/self/cgroup walk below, under nested mpiexec/palsd,
+		# can land in a sibling cgroup whose pids.max reads "max".
+		local pids_max_file="" pids_cur_file=""
+		if [[ -n "${PBS_SHORT_JOBID:-}" && -r "/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max" ]]; then
+			pids_max_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max"
+			pids_cur_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.current"
+		fi
 		local cgpath=""
 		if [[ -r /proc/self/cgroup ]]; then
 			cgpath="$(awk -F: "\$1 == \"0\" {print \$3; exit}" /proc/self/cgroup)"
@@ -818,8 +964,7 @@ print_process_diagnostics() {
 				cgpath="$(awk -F: "\$2 == \"pids\" {print \$3; exit}" /proc/self/cgroup)"
 			fi
 		fi
-		local pids_max_file="" pids_cur_file=""
-		if [[ -n "${cgpath}" ]]; then
+		if [[ -z "${pids_max_file}" && -n "${cgpath}" ]]; then
 			local probe="${cgpath}"
 			while true; do
 				if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
@@ -949,19 +1094,33 @@ start_background_sampler() {
 	# while the flag file exists. Exits cleanly when the flag is removed.
 	# Inline cgroup resolution (duplicated from print_process_diagnostics)
 	# so the loop body is self-contained.
-	local q_diag_dir q_user q_flag
+	local q_diag_dir q_user q_flag q_short_jobid
 	q_diag_dir="$(printf '%q' "${DIAG_DIR}")"
 	q_user="$(printf '%q' "${USER}")"
 	q_flag="$(printf '%q' "${SAMPLER_FLAG}")"
+	q_short_jobid="$(printf '%q' "${PBS_SHORT_JOBID:-}")"
 
 	local remote_script='
 export DIAG_DIR='"${q_diag_dir}"'
 export USER='"${q_user}"'
 export FLAG='"${q_flag}"'
+export PBS_SHORT_JOBID='"${q_short_jobid}"'
 hostname="$(hostname 2>/dev/null || echo unknown)"
 out="${DIAG_DIR}/sampler_${hostname}.csv"
 
 # Resolve the binding cgroup pids.max / pids.current files once.
+# Polaris-specific fast path: prefer /sys/fs/cgroup/jobs/<short_jobid>/
+# over the /proc/self/cgroup walk. Under nested mpiexec/palsd, the
+# walk can land in a sibling cgroup whose pids.max reads "max", which
+# gives a CSV with pids_max=max (misleading) even when the binding
+# cap is 4096. If the Polaris path is unreadable (non-Polaris site,
+# or cgroup moved), fall through to the portable walk.
+pids_max_file=""
+pids_cur_file=""
+if [[ -n "${PBS_SHORT_JOBID:-}" && -r "/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max" ]]; then
+	pids_max_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.max"
+	pids_cur_file="/sys/fs/cgroup/jobs/${PBS_SHORT_JOBID}/pids.current"
+fi
 cgpath=""
 if [[ -r /proc/self/cgroup ]]; then
 	cgpath="$(awk -F: "\$1 == \"0\" {print \$3; exit}" /proc/self/cgroup)"
@@ -969,9 +1128,7 @@ if [[ -r /proc/self/cgroup ]]; then
 		cgpath="$(awk -F: "\$2 == \"pids\" {print \$3; exit}" /proc/self/cgroup)"
 	fi
 fi
-pids_max_file=""
-pids_cur_file=""
-if [[ -n "${cgpath}" ]]; then
+if [[ -z "${pids_max_file}" && -n "${cgpath}" ]]; then
 	probe="${cgpath}"
 	while true; do
 		if [[ -r "/sys/fs/cgroup${probe}/pids.max" ]]; then
@@ -1135,11 +1292,12 @@ print_process_diagnostics_all_nodes "01_pre_ray"
 ray start --head \
 	--node-ip-address="${HEAD_IP}" \
 	--port="${RAY_PORT}" \
+	--num-cpus="${NUM_RAY_CPUS_PER_NODE}" \
 	--num-gpus="${GPUS_PER_NODE}" \
 	--temp-dir="${RAY_TMPDIR}" \
 	--include-dashboard=false
 
-echo "Ray head started. (dashboard disabled to conserve cgroup pids.max budget)"
+echo "Ray head started. (dashboard disabled, --num-cpus=${NUM_RAY_CPUS_PER_NODE} to cap idle worker pool)"
 
 # Tell vLLM drivers and every subprocess they spawn to ATTACH to this Ray
 # cluster rather than fall through to ray.init(address=None) and start a
@@ -1223,6 +1381,27 @@ launch_worker() {
 		export VLLM_NO_USAGE_STATS='${VLLM_NO_USAGE_STATS}'
 		export DO_NOT_TRACK='${DO_NOT_TRACK}'
 
+		# Ray idle worker pool cap (see RAY IDLE WORKER POOL LIMIT
+		# block in the driver script). The worker also passes
+		# --num-cpus=${NUM_RAY_CPUS_PER_NODE} to ray start below;
+		# RAY_num_workers_soft_limit is a belt-and-suspenders env
+		# knob that caps the idle pool independent of --num-cpus.
+		export RAY_num_workers_soft_limit='${RAY_num_workers_soft_limit}'
+
+		# PyTorch NCCL per-PG thread minimization (see PYTORCH NCCL
+		# PER-PG THREAD MINIMIZATION block in the driver script).
+		# Disables the optional heartbeat-monitor / trace-buffer /
+		# dump-on-timeout threads that each new 2-rank NCCL subcomm
+		# would otherwise spawn under lazy P2P init.
+		export TORCH_NCCL_ENABLE_MONITORING='${TORCH_NCCL_ENABLE_MONITORING}'
+		export TORCH_NCCL_TRACE_BUFFER_SIZE='${TORCH_NCCL_TRACE_BUFFER_SIZE}'
+		export TORCH_NCCL_DUMP_ON_TIMEOUT='${TORCH_NCCL_DUMP_ON_TIMEOUT}'
+
+		# Plumb the PBS short job id through so worker-side diagnostics
+		# / sampler can resolve the per-job cgroup at
+		# /sys/fs/cgroup/jobs/<short_jobid>/ directly.
+		export PBS_SHORT_JOBID='${PBS_SHORT_JOBID}'
+
 		# NCCL/Gloo must use the same interface as on the head node.
 		export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
 		export GLOO_SOCKET_IFNAME='${RAY_IFNAME}'
@@ -1247,6 +1426,7 @@ launch_worker() {
 			if ray start \\
 				--address='${HEAD_IP}:${RAY_PORT}' \\
 				--node-ip-address='${worker_ip}' \\
+				--num-cpus=${NUM_RAY_CPUS_PER_NODE} \\
 				--num-gpus=${GPUS_PER_NODE} \\
 				--temp-dir='${RAY_TMPDIR}' \\
 				--block; then
