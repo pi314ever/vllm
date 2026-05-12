@@ -3,15 +3,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # =============================================================================
-# PBS Pro Job Script - N-Node DeepSeek-R1 Benchmark on ALCF Polaris
+# Shared body for PBS Pro benchmark wrappers on ALCF Polaris
 # =============================================================================
 #
-# Single qsub-submittable script that orchestrates the full N-node benchmark:
-#   1. Discovers allocated nodes from PBS_NODEFILE
-#   2. Launches Ray head on node 0, Ray workers on nodes 1..N-1 (via mpiexec)
-#   3. Runs offline latency benchmarks (vllm bench latency)
-#   4. Starts vLLM API server and runs online serving benchmarks
-#   5. Cleans up Ray on all nodes on exit
+# This file is a SOURCED LIBRARY, not a submittable script. It is `source`d
+# from thin wrapper files that supply their own #PBS directives and per-run
+# environment overrides, e.g.:
+#   qsub_polaris_deepseek_v3_latency_bs1.sh
+#   qsub_polaris_deepseek_v3_latency_bs8.sh
+#   qsub_polaris_deepseek_v3_latency_bs32.sh
+#   qsub_polaris_deepseek_v3_serving.sh
+#   qsub_polaris_deepseek_v3_throughput.sh
+#
+# Each wrapper:
+#   1. Declares its own #PBS directives (select, walltime, queue, -N, etc.).
+#   2. Exports config-specific overrides (BATCH_SIZES_CSV, RUN_LATENCY,
+#      RUN_SERVING, RUN_THROUGHPUT, MODEL, ...).
+#   3. Ends with `source "${PBS_O_WORKDIR}/qsub_polaris_body.sh"`.
+#
+# Responsibilities of this body:
+#   1. Discover allocated nodes from PBS_NODEFILE.
+#   2. Launch Ray head on node 0, Ray workers on nodes 1..N-1 (via mpiexec).
+#   3. Optionally run offline latency benchmarks (Step 4; RUN_LATENCY=1).
+#   4. Optionally start vLLM API server and run serving benchmarks
+#      (Step 5; RUN_SERVING=1).
+#   5. Optionally run offline throughput benchmarks (Step 6; RUN_THROUGHPUT=1).
+#   6. Clean up Ray on all nodes on exit.
 #
 # Parallelism model (defaults):
 #   NUM_NODES=6, GPUS_PER_NODE=4  -> 24 GPUs total
@@ -25,36 +42,46 @@
 # by this script; extend QUANT_ARGS / ENGINE_ARGS if you need it).
 #
 # Hardware:      Polaris nodes x 4x A100-80GB
-# Model:         deepseek-ai/DeepSeek-R1 (671B MoE, FP8)
+# Default model: deepseek-ai/DeepSeek-R1 (671B MoE, FP8); wrappers override.
 #
 # Usage:
-#   # Edit the -A project allocation below, then:
-#   qsub qsub_polaris.sh
+#   # Submit a single wrapper:
+#   qsub qsub_polaris_deepseek_v3_latency_bs8.sh
 #
-#   # Override settings at submission time (note: the PBS `select=` directive
-#   # is baked into the file, so if you change NUM_NODES you must either edit
-#   # the -l select=... line below OR override it on the qsub command line):
-#   qsub -l select=4:system=polaris:ncpus=32:ngpus=4 \
-#        -v NUM_NODES=4,PP_SIZE=4,TP_SIZE=4 qsub_polaris.sh
+#   # Submit the whole DeepSeek-V3 suite:
+#   for f in qsub_polaris_deepseek_v3_*.sh; do qsub "$f"; done
+#
+#   # Override a knob at submission time (qsub -v strips whitespace, so CSVs
+#   # use comma separators, e.g. BATCH_SIZES_CSV=1,8,32):
+#   qsub -v BATCH_SIZES_CSV=4,16,64 qsub_polaris_deepseek_v3_latency_bs8.sh
 #
 # =============================================================================
-
-# =============================================================================
-# PBS DIRECTIVES
-# =============================================================================
-# NOTE: The `select=N` count here MUST match NUM_NODES in the user config
-# section below, or be overridden at submission time with `qsub -l select=...`.
-
-#PBS -l select=6:system=polaris:ncpus=32:ngpus=4
-#PBS -l walltime=01:00:00
-#PBS -l filesystems=home:grand
-#PBS -q debug-scaling
-#PBS -A Intel
-#PBS -N vllm-deepseek-r1-bench
-#PBS -j oe
-#PBS -V
 
 set -euo pipefail
+
+# =============================================================================
+# DIRECT-SUBMIT GUARD
+# =============================================================================
+# This file is not meant to be submitted directly (it has no #PBS directives
+# of its own). If someone runs `qsub qsub_polaris_body.sh` or
+# `bash qsub_polaris_body.sh`, PBS_NODEFILE is unset (no job context) AND
+# BASH_SOURCE[0] == $0 (this file is the top-level script, not sourced).
+# In that case, refuse with a clear message pointing at the wrapper files.
+#
+# When sourced from a wrapper, BASH_SOURCE[0] is this file's path but $0 is
+# the wrapper's path, so the guard is skipped.
+if [[ "${BASH_SOURCE[0]}" == "${0}" && -z "${PBS_NODEFILE:-}" ]]; then
+	echo "ERROR: qsub_polaris_body.sh is a sourced library, not a"
+	echo "       submittable script. Submit one of the wrapper files:"
+	echo "         qsub qsub_polaris_deepseek_v3_latency_bs1.sh"
+	echo "         qsub qsub_polaris_deepseek_v3_latency_bs8.sh"
+	echo "         qsub qsub_polaris_deepseek_v3_latency_bs32.sh"
+	echo "         qsub qsub_polaris_deepseek_v3_serving.sh"
+	echo "         qsub qsub_polaris_deepseek_v3_throughput.sh"
+	echo "       Or submit the whole suite:"
+	echo "         for f in qsub_polaris_deepseek_v3_*.sh; do qsub \"\$f\"; done"
+	exit 1
+fi
 
 export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"
@@ -260,6 +287,23 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 # when submitting to a longer-walltime queue (e.g. prod).
 NUM_PROMPTS="${NUM_PROMPTS:-200}"
 NUM_WARMUPS="${NUM_WARMUPS:-2}"
+
+# =============================================================================
+# BENCHMARK STEP GATES
+# =============================================================================
+# Each of Steps 4, 5, 6 can be independently turned on or off by the
+# wrapper. A wrapper that only wants the latency sweep sets
+# RUN_LATENCY=1, RUN_SERVING=0, RUN_THROUGHPUT=0 before `source`ing
+# this body. Defaults leave latency + serving on (matches the pre-
+# refactor monolith) and throughput off (it's new and opt-in).
+#
+# Steps 1-3 (Ray cluster bring-up and 00-04 diagnostics) always run;
+# a benchmark job that disables all three RUN_* knobs still brings up
+# the cluster and takes process-limit snapshots, which is useful for
+# pure infrastructure debugging.
+RUN_LATENCY="${RUN_LATENCY:-1}"
+RUN_SERVING="${RUN_SERVING:-1}"
+RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
 
 # =============================================================================
 # NETWORK CONFIGURATION (Polaris Slingshot)
@@ -1502,15 +1546,15 @@ done
 print_process_diagnostics_all_nodes "03_cluster_ready"
 
 # =============================================================================
-# STEP 4: Run Offline Latency Benchmarks
+# STEP 4-6 SHARED SETUP (always runs)
 # =============================================================================
+# Everything in this block is required regardless of which benchmark
+# steps are enabled: output directories, engine args, sweep matrices,
+# the final pre-engine diagnostic snapshot, and the background sampler.
+# Individual benchmark steps below (4/5/6) are each gated by their
+# RUN_* flag.
 
 mkdir -p "${RESULTS_DIR}"
-
-echo ""
-echo "[Step 4/5] Running offline latency benchmarks..."
-echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
-echo ""
 
 ENGINE_ARGS=(
 	--model "${MODEL}"
@@ -1542,12 +1586,17 @@ ENGINE_ARGS=(
 #
 # The engine-init cost dominates the actual benchmark cost, so we keep
 # the sweep small: three batch sizes that span the light/medium/heavy
-# concurrency regimes, at a single representative input length. Edit
-# these arrays directly to expand coverage on a longer-walltime queue
-# (env-var overrides of bash arrays are awkward, so we don't wire them).
-BATCH_SIZES=(1 8 32)
-INPUT_LENS=(512)
-OUTPUT_LEN=128
+# concurrency regimes, at a single representative input length.
+#
+# Latency batch sizes and I/O shapes are env-overridable via comma-
+# separated strings. `qsub -v` discards whitespace, so CSVs (no spaces)
+# are the friendly wire format. The bash arrays used by the loop are
+# derived from the CSVs once here.
+BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1,8,32}"
+INPUT_LENS_CSV="${INPUT_LENS_CSV:-512}"
+OUTPUT_LEN="${OUTPUT_LEN:-128}"
+IFS=',' read -r -a BATCH_SIZES <<<"${BATCH_SIZES_CSV}"
+IFS=',' read -r -a INPUT_LENS  <<<"${INPUT_LENS_CSV}"
 
 # Iteration counts. 2 warmup + 10 measured iters is the smallest window
 # where per-iter variance stays tight enough to report p50/p99 latency
@@ -1565,33 +1614,48 @@ print_process_diagnostics_all_nodes "04_pre_engine"
 # Kick off the continuous 2s sampler on every node. It writes
 # ${DIAG_DIR}/sampler_<hostname>.csv and is torn down by the ERR trap,
 # by the EXIT/cleanup trap, or by the explicit stop_background_sampler
-# call at the end of this step.
+# call at the end of the script.
 start_background_sampler
 
-for INPUT_LEN in "${INPUT_LENS[@]}"; do
-	for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
-		RESULT_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.json"
-		LOG_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.log"
+# =============================================================================
+# STEP 4: Run Offline Latency Benchmarks
+# =============================================================================
 
-		echo "  >> Latency: batch_size=${BATCH_SIZE}, input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}"
+if [[ "${RUN_LATENCY}" == "1" ]]; then
+	echo ""
+	echo "[Step 4/6] Running offline latency benchmarks..."
+	echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
+	echo "  Sweep: batch_sizes=[${BATCH_SIZES[*]}] input_lens=[${INPUT_LENS[*]}] output_len=${OUTPUT_LEN}"
+	echo ""
 
-		vllm bench latency \
-			"${ENGINE_ARGS[@]}" \
-			--batch-size "${BATCH_SIZE}" \
-			--input-len "${INPUT_LEN}" \
-			--output-len "${OUTPUT_LEN}" \
-			--num-iters-warmup "${LATENCY_WARMUP_ITERS}" \
-			--num-iters "${LATENCY_ITERS}" \
-			--output-json "${RESULT_FILE}" \
-			2>&1 | tee "${LOG_FILE}"
+	for INPUT_LEN in "${INPUT_LENS[@]}"; do
+		for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+			RESULT_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.json"
+			LOG_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.log"
 
-		echo "  >> Saved to ${RESULT_FILE}"
-		echo ""
+			echo "  >> Latency: batch_size=${BATCH_SIZE}, input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}"
+
+			vllm bench latency \
+				"${ENGINE_ARGS[@]}" \
+				--batch-size "${BATCH_SIZE}" \
+				--input-len "${INPUT_LEN}" \
+				--output-len "${OUTPUT_LEN}" \
+				--num-iters-warmup "${LATENCY_WARMUP_ITERS}" \
+				--num-iters "${LATENCY_ITERS}" \
+				--output-json "${RESULT_FILE}" \
+				2>&1 | tee "${LOG_FILE}"
+
+			echo "  >> Saved to ${RESULT_FILE}"
+			echo ""
+		done
 	done
-done
 
-echo "Offline latency benchmarks complete."
-echo ""
+	echo "Offline latency benchmarks complete."
+	echo ""
+else
+	echo "[Step 4/6] Skipping offline latency benchmarks (RUN_LATENCY=${RUN_LATENCY})."
+	echo ""
+fi
 
 # Snapshot just before vllm serve. Between Step 4 (offline latency) and
 # here, the offline engine has torn itself down but some processes may
@@ -1604,7 +1668,8 @@ print_process_diagnostics_all_nodes "05_pre_vllm_serve"
 # STEP 5: Online Serving Benchmark
 # =============================================================================
 
-echo "[Step 5/5] Starting vLLM server and running serving benchmarks..."
+if [[ "${RUN_SERVING}" == "1" ]]; then
+	echo "[Step 5/6] Starting vLLM server and running serving benchmarks..."
 
 # Start the vLLM server in the background.
 # Use a process group so we can cleanly kill the server and its children.
@@ -1664,12 +1729,14 @@ done
 #   - request_rate=8:    ~25 s
 #   - request_rate=inf:  ~15-30 s (saturated; bound by server throughput)
 # Three rates x two IO configs = 6 runs ~= 8-12 min total, including
-# brief per-config ramp-up. Expand on a longer-walltime queue.
-REQUEST_RATES=(1 8 inf)
-IO_CONFIGS=(
-	"512:128"
-	"128:512"
-)
+# brief per-config ramp-up.
+#
+# Request rates and IO shapes are env-overridable via comma-separated
+# strings (qsub -v friendly). IO shapes are "<input>:<output>" pairs.
+REQUEST_RATES_CSV="${REQUEST_RATES_CSV:-1,8,inf}"
+IO_CONFIGS_CSV="${IO_CONFIGS_CSV:-512:128,128:512}"
+IFS=',' read -r -a REQUEST_RATES <<<"${REQUEST_RATES_CSV}"
+IFS=',' read -r -a IO_CONFIGS    <<<"${IO_CONFIGS_CSV}"
 
 echo ""
 echo "Starting serving benchmark sweep..."
@@ -1720,6 +1787,67 @@ for IO_CONFIG in "${IO_CONFIGS[@]}"; do
 	done
 done
 
+echo "Online serving benchmarks complete."
+echo ""
+
+else
+	echo "[Step 5/6] Skipping online serving benchmarks (RUN_SERVING=${RUN_SERVING})."
+	echo ""
+fi
+
+# =============================================================================
+# STEP 6: Offline Throughput Benchmark
+# =============================================================================
+# `vllm bench throughput` spins up a fresh `LLM` engine per invocation and
+# submits NUM_PROMPTS requests as a single saturated batch, measuring total
+# prompt+generation tokens/s. Unlike latency, throughput does not iterate
+# over --batch-size (max batching is bounded by the engine's runtime limits),
+# so the sweep is over IO shapes only.
+#
+# CLI flags (see vllm/benchmarks/throughput.py:add_cli_args):
+#   --dataset-name random  (synthesizes random prompts)
+#   --input-len N --output-len N
+#   --num-prompts N        (total prompts submitted in the batch)
+#   --output-json PATH
+# Engine config flags (model, TP/PP, quantization, enforce-eager) are shared
+# with Steps 4/5 via ENGINE_ARGS.
+
+if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
+	echo "[Step 6/6] Running offline throughput benchmarks..."
+	echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
+	echo "  Sweep: io_configs=[${IO_CONFIGS[*]}]"
+	echo ""
+
+	for IO_CONFIG in "${IO_CONFIGS[@]}"; do
+		INPUT_LEN="${IO_CONFIG%%:*}"
+		OUTPUT_LEN="${IO_CONFIG##*:}"
+
+		RESULT_LABEL="throughput_in${INPUT_LEN}_out${OUTPUT_LEN}"
+		RESULT_FILE="${RESULTS_DIR}/${RESULT_LABEL}.json"
+		LOG_FILE="${RESULTS_DIR}/${RESULT_LABEL}.log"
+
+		echo "  >> Throughput: input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}"
+
+		vllm bench throughput \
+			"${ENGINE_ARGS[@]}" \
+			--dataset-name random \
+			--input-len "${INPUT_LEN}" \
+			--output-len "${OUTPUT_LEN}" \
+			--num-prompts "${NUM_PROMPTS}" \
+			--output-json "${RESULT_FILE}" \
+			2>&1 | tee "${LOG_FILE}"
+
+		echo "  >> Saved to ${RESULT_FILE}"
+		echo ""
+	done
+
+	echo "Offline throughput benchmarks complete."
+	echo ""
+else
+	echo "[Step 6/6] Skipping offline throughput benchmarks (RUN_THROUGHPUT=${RUN_THROUGHPUT})."
+	echo ""
+fi
+
 # =============================================================================
 # SUMMARY
 # =============================================================================
@@ -1737,9 +1865,13 @@ echo ""
 echo "Serving results:"
 ls -1 "${RESULTS_DIR}"/serving_*.json 2>/dev/null || echo "  (no serving JSON files)"
 echo ""
+echo "Throughput results:"
+ls -1 "${RESULTS_DIR}"/throughput_*.json 2>/dev/null || echo "  (no throughput JSON files)"
+echo ""
 echo "Metrics recorded:"
-echo "  - Offline: end-to-end latency per batch size / input length"
-echo "  - Online:  TTFT, TPOT, ITL, E2EL at p50/p90/p95/p99"
+echo "  - Offline latency:    end-to-end latency per (batch size, input length)"
+echo "  - Online serving:     TTFT, TPOT, ITL, E2EL at p50/p90/p95/p99"
+echo "  - Offline throughput: total tokens/s per IO shape"
 echo "  - Online:  request throughput, token throughput"
 echo ""
 echo "Cleanup will run automatically via EXIT trap."
