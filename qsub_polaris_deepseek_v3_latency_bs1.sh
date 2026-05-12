@@ -32,6 +32,8 @@
 # user supplied, so the wrapper's defaults are "only if not overridden".
 export MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
 export BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1}"
+export INPUT_LENS_CSV="${INPUT_LENS_CSV:-1024}"
+export OUTPUT_LEN="${OUTPUT_LEN:-4096}"
 export RUN_LATENCY="${RUN_LATENCY:-1}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
