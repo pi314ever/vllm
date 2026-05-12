@@ -15,7 +15,7 @@
 #   qsub qsub_polaris_deepseek_v3_latency_bs8.sh
 #
 # Submit-time overrides (qsub -v):
-#   qsub -v INPUT_LENS_CSV=512,2048 qsub_polaris_deepseek_v3_latency_bs8.sh
+#   qsub -v LATENCY_IO_CONFIGS_CSV=512:128,1024:4096 qsub_polaris_deepseek_v3_latency_bs8.sh
 #
 # =============================================================================
 

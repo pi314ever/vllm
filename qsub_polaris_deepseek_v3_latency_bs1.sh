@@ -15,7 +15,7 @@
 #   qsub qsub_polaris_deepseek_v3_latency_bs1.sh
 #
 # Submit-time overrides (qsub -v):
-#   qsub -v INPUT_LENS_CSV=512,2048 qsub_polaris_deepseek_v3_latency_bs1.sh
+#   qsub -v LATENCY_IO_CONFIGS_CSV=512:128,1024:4096 qsub_polaris_deepseek_v3_latency_bs1.sh
 #
 # =============================================================================
 
@@ -32,8 +32,10 @@
 # user supplied, so the wrapper's defaults are "only if not overridden".
 export MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
 export BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1}"
-export INPUT_LENS_CSV="${INPUT_LENS_CSV:-1024}"
-export OUTPUT_LEN="${OUTPUT_LEN:-4096}"
+# (input:output) pairs, comma-separated. Matches Step 5/6 IO_CONFIGS_CSV
+# syntax. bs1 targets a long-context, long-generation interactive shape
+# (1024 prompt / 4096 decode) to stress single-stream decode latency.
+export LATENCY_IO_CONFIGS_CSV="${LATENCY_IO_CONFIGS_CSV:-1024:4096,4096:1024}"
 export RUN_LATENCY="${RUN_LATENCY:-1}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"

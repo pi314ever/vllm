@@ -274,17 +274,24 @@ echo "[Step 1/3] Offline latency sweep..."
 echo "  Engine config: TP=${TP_SIZE}, PP=${PP_SIZE}, backend=${DIST_BACKEND}"
 echo ""
 
-# Latency sweep matrix. Three batch sizes at one representative input
-# length: small / medium / large concurrency at fixed context. Each pair
-# triggers a fresh engine init (model load, profile, KV cache, warmup).
+# Latency sweep matrix. Three batch sizes at one representative (input,
+# output) shape: small / medium / large concurrency at fixed context.
+# Each (batch_size, input_len, output_len) triple triggers a fresh
+# engine init (model load, profile, KV cache, warmup).
+#
+# LATENCY_IO_CONFIGS_CSV uses the same "<input>:<output>,..." format as
+# Step 3's IO_CONFIGS (e.g. "512:128,128:512").
 BATCH_SIZES=(1 8 32)
-INPUT_LENS=(512)
-OUTPUT_LEN=128
+LATENCY_IO_CONFIGS_CSV="${LATENCY_IO_CONFIGS_CSV:-512:128}"
+IFS=',' read -r -a LATENCY_IO_CONFIGS <<<"${LATENCY_IO_CONFIGS_CSV}"
 
 LATENCY_WARMUP_ITERS="${LATENCY_WARMUP_ITERS:-2}"
 LATENCY_ITERS="${LATENCY_ITERS:-10}"
 
-for INPUT_LEN in "${INPUT_LENS[@]}"; do
+for IO_CONFIG in "${LATENCY_IO_CONFIGS[@]}"; do
+	INPUT_LEN="${IO_CONFIG%%:*}"
+	OUTPUT_LEN="${IO_CONFIG##*:}"
+
 	for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
 		RESULT_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.json"
 		LOG_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.log"

@@ -1685,24 +1685,30 @@ ENGINE_ARGS=(
 
 # Latency sweep matrix.
 #
-# Each (BATCH_SIZE, INPUT_LEN) pair triggers a full `vllm bench latency`
-# invocation, which in turn spins up a fresh vLLM engine (model load,
-# profile, KV cache, warmup, CUDA graph capture). On 16x A100 DeepSeek
-# that's ~60-90s per invocation with a warm Inductor/Triton cache.
+# Each (BATCH_SIZE, INPUT_LEN, OUTPUT_LEN) triple triggers a full
+# `vllm bench latency` invocation, which in turn spins up a fresh vLLM
+# engine (model load, profile, KV cache, warmup, CUDA graph capture).
+# On 16x A100 DeepSeek that's ~60-90s per invocation with a warm
+# Inductor/Triton cache.
 #
 # The engine-init cost dominates the actual benchmark cost, so we keep
 # the sweep small: three batch sizes that span the light/medium/heavy
-# concurrency regimes, at a single representative input length.
+# concurrency regimes, at a single representative (input, output) shape.
 #
 # Latency batch sizes and I/O shapes are env-overridable via comma-
 # separated strings. `qsub -v` discards whitespace, so CSVs (no spaces)
-# are the friendly wire format. The bash arrays used by the loop are
+# are the friendly wire format.
+#
+# LATENCY_IO_CONFIGS_CSV replaces the older INPUT_LENS_CSV + OUTPUT_LEN
+# pair so that each latency invocation can independently vary BOTH the
+# prompt length and the generation length. Format matches Steps 5/6's
+# IO_CONFIGS_CSV: "<input>:<output>" pairs, comma-separated
+# (e.g. "512:128,1024:4096"). The bash arrays used by the loop are
 # derived from the CSVs once here.
 BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1,8,32}"
-INPUT_LENS_CSV="${INPUT_LENS_CSV:-512}"
-OUTPUT_LEN="${OUTPUT_LEN:-128}"
-IFS=',' read -r -a BATCH_SIZES <<<"${BATCH_SIZES_CSV}"
-IFS=',' read -r -a INPUT_LENS  <<<"${INPUT_LENS_CSV}"
+LATENCY_IO_CONFIGS_CSV="${LATENCY_IO_CONFIGS_CSV:-512:128}"
+IFS=',' read -r -a BATCH_SIZES       <<<"${BATCH_SIZES_CSV}"
+IFS=',' read -r -a LATENCY_IO_CONFIGS <<<"${LATENCY_IO_CONFIGS_CSV}"
 
 # Iteration counts. 2 warmup + 10 measured iters is the smallest window
 # where per-iter variance stays tight enough to report p50/p99 latency
@@ -1767,10 +1773,13 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 	echo ""
 	echo "[Step 4/6] Running offline latency benchmarks..."
 	echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
-	echo "  Sweep: batch_sizes=[${BATCH_SIZES[*]}] input_lens=[${INPUT_LENS[*]}] output_len=${OUTPUT_LEN}"
+	echo "  Sweep: batch_sizes=[${BATCH_SIZES[*]}] io_configs=[${LATENCY_IO_CONFIGS[*]}]"
 	echo ""
 
-	for INPUT_LEN in "${INPUT_LENS[@]}"; do
+	for IO_CONFIG in "${LATENCY_IO_CONFIGS[@]}"; do
+		INPUT_LEN="${IO_CONFIG%%:*}"
+		OUTPUT_LEN="${IO_CONFIG##*:}"
+
 		for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
 			RESULT_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.json"
 			LOG_FILE="${RESULTS_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}.log"
