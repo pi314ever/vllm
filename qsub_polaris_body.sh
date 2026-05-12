@@ -29,6 +29,9 @@
 #      (Step 5; RUN_SERVING=1).
 #   5. Optionally run offline throughput benchmarks (Step 6; RUN_THROUGHPUT=1).
 #   6. Clean up Ray on all nodes on exit.
+#   7. Optionally wrap every bench invocation with the torch profiler and
+#      emit Perfetto-viewable traces (PROFILE=1). See the PROFILING CONFIG
+#      block below for knobs and trade-offs.
 #
 # Parallelism model (defaults):
 #   NUM_NODES=6, GPUS_PER_NODE=4  -> 24 GPUs total
@@ -54,6 +57,11 @@
 #   # Override a knob at submission time (qsub -v strips whitespace, so CSVs
 #   # use comma separators, e.g. BATCH_SIZES_CSV=1,8,32):
 #   qsub -v BATCH_SIZES_CSV=4,16,64 qsub_polaris_deepseek_v3_latency_bs8.sh
+#
+#   # Enable torch-profiler tracing for every bench invocation (emits
+#   # gzipped Perfetto traces to /grand/Intel/dhuang/vllm_polaris_profiles/
+#   # by default; see PROFILING CONFIG below):
+#   qsub -v PROFILE=1 qsub_polaris_deepseek_v3_latency_bs8.sh
 #
 # =============================================================================
 
@@ -304,6 +312,104 @@ NUM_WARMUPS="${NUM_WARMUPS:-2}"
 RUN_LATENCY="${RUN_LATENCY:-1}"
 RUN_SERVING="${RUN_SERVING:-1}"
 RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
+
+# =============================================================================
+# PROFILING CONFIG
+# =============================================================================
+# Torch-profiler integration. When PROFILE=1, every enabled bench step below
+# (Step 4 latency / Step 5 serving / Step 6 throughput) is invoked with
+# vLLM's torch-profiler wiring:
+#
+#   --profiler-config '{"profiler":"torch","torch_profiler_dir":"<dir>",
+#                       "torch_profiler_record_shapes":true,
+#                       "torch_profiler_with_stack":false}'
+#   --profile
+#
+# Field choices (vs. vllm/config/profiler.py defaults):
+#   * torch_profiler_record_shapes=true  (default false): records tensor
+#     shapes so the trace distinguishes e.g. a prefill vs decode matmul
+#     with different (M,K) shapes. Small overhead, useful for reading
+#     traces on a heterogeneous PP/TP deployment.
+#   * torch_profiler_with_stack=false   (default true):  skips Python
+#     stack capture. Stacks are large and mostly redundant once you
+#     have shapes; omitting them trims trace size meaningfully on 24
+#     ranks.
+#   * torch_profiler_use_gzip=true, torch_profiler_dump_cuda_time_total=true,
+#     torch_profiler_with_memory=false, torch_profiler_with_flops=false
+#     are all left at their defaults.
+#
+# Mechanism:
+#   * `vllm/benchmarks/{latency,throughput,serve}.py` all accept --profile
+#     and thread --profiler-config through to the engine. See
+#     vllm/config/profiler.py:33 (ProfilerConfig) for the full field list.
+#   * The driver's ProfilerConfig is transported to every worker over Ray
+#     via VllmConfig, so worker-side tracing "just works" with no extra
+#     env plumbing in launch_worker(). Verified at
+#     vllm/v1/worker/gpu_worker.py:143-151.
+#   * Each worker emits one `rank_<N>.pt.trace.json.gz` file per run into
+#     torch_profiler_dir. Driver-side AsyncLLM front-end traces are also
+#     written to the same directory (vllm/v1/engine/async_llm.py:179-196).
+#   * Traces are viewable directly at https://ui.perfetto.dev/ (no untar
+#     required; the UI accepts .json.gz).
+#
+# Cost / trade-offs on DeepSeek-V3 @ PP=6, TP=4 (24 ranks):
+#   * Traces are large. Expect O(100 MB) per rank per short run, so a
+#     single (bs, input_len) pair can produce ~2-24 GB of traces. The
+#     whole Step 4 sweep with 3 batch sizes x 1 input length = ~3x that.
+#     Plan for tens of GB on disk when PROFILE=1.
+#   * `/stop_profile` synchronously flushes every rank's trace before
+#     returning. For a 671B model this can take several minutes; we
+#     bump VLLM_RPC_TIMEOUT below to keep the bench client from
+#     timing out mid-flush.
+#   * Profiling adds runtime overhead (doc warns "will significantly
+#     slow down the inference"; see docs/contributing/profiling.md:4).
+#     We reduce the per-step workload to the minimum that still covers
+#     engine init + a couple of forward passes:
+#       - `vllm bench latency --profile` already internally runs exactly
+#         ONE profiled iteration after warmup and then returns
+#         (vllm/benchmarks/latency.py:139-149). `--num-iters` is ignored
+#         in this path; only --num-iters-warmup matters.
+#       - `vllm bench throughput --profile` wraps the full --num-prompts
+#         batch. Overridden to PROFILE_NUM_PROMPTS.
+#       - `vllm bench serve --profile` hits /start_profile before the
+#         sweep and /stop_profile after (serve.py:751,1107). Overridden
+#         to PROFILE_NUM_PROMPTS per request rate.
+#   * First-run cold compile still runs inside the profiled region,
+#     so the first trace will include gcc/ld fork noise from Triton
+#     JIT. Re-run on a warm TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR
+#     (already set to /grand/.../vllm_polaris_cache above) to get a
+#     clean steady-state trace.
+#
+# Filesystem layout:
+#   PROFILE_DIR/
+#     latency_bs<BS>_in<IN>_out<OUT>/      (one dir per Step 4 invocation)
+#     throughput_in<IN>_out<OUT>/          (one dir per Step 6 invocation)
+#     serving/                             (single dir; start_profile has
+#                                           no prefix arg so all Step 5
+#                                           runs share this dir)
+#   Traces land on /grand by default so they're visible from every node
+#   AND don't eat the repo checkout's /home quota. Override at submit
+#   time via `qsub -v PROFILE_DIR=/path/to/out` if needed.
+#
+# Knobs:
+PROFILE="${PROFILE:-0}"
+PROFILE_DIR="${PROFILE_DIR:-/grand/Intel/dhuang/vllm_polaris_profiles/${JOB_NAME}}"
+# Reduced workload sizes used only when PROFILE=1. Kept small because
+# every rank flushes its own multi-hundred-MB trace on stop and trace
+# volume scales linearly with workload. Override at submit time if you
+# want a longer-steady-state trace (and have the disk / walltime for
+# it).
+PROFILE_NUM_PROMPTS="${PROFILE_NUM_PROMPTS:-5}"
+PROFILE_LATENCY_WARMUP_ITERS="${PROFILE_LATENCY_WARMUP_ITERS:-2}"
+
+if [[ "${PROFILE}" == "1" ]]; then
+	# Bump the internal RPC timeout so that the client side of
+	# `vllm bench serve --profile` does not abort while `/stop_profile`
+	# is still flushing per-rank trace files. 30 minutes matches the
+	# upper bound cited in docs/contributing/profiling.md. Honor any
+	# pre-existing user override (don't clobber).
+	export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1800000}"
+fi
 
 # =============================================================================
 # NETWORK CONFIGURATION (Polaris Slingshot)
@@ -1605,6 +1711,42 @@ IFS=',' read -r -a INPUT_LENS  <<<"${INPUT_LENS_CSV}"
 LATENCY_WARMUP_ITERS="${LATENCY_WARMUP_ITERS:-2}"
 LATENCY_ITERS="${LATENCY_ITERS:-10}"
 
+# -----------------------------------------------------------------------------
+# PROFILING: per-run setup
+# -----------------------------------------------------------------------------
+# When PROFILE=1, trim the bench workloads down to a profiler-friendly size
+# (a single latency iteration after warmup is all `vllm bench latency
+# --profile` actually runs; keeping NUM_PROMPTS small bounds serving +
+# throughput trace volume) and create the shared output directory.
+#
+# These reassignments intentionally override any caller-supplied
+# NUM_PROMPTS / LATENCY_WARMUP_ITERS only when PROFILE=1 AND the caller
+# has not explicitly set PROFILE_NUM_PROMPTS / PROFILE_LATENCY_WARMUP_ITERS
+# to a different value. That lets a submitter write
+#   qsub -v PROFILE=1,PROFILE_NUM_PROMPTS=32 ...
+# to override the profile defaults.
+if [[ "${PROFILE}" == "1" ]]; then
+	NUM_PROMPTS="${PROFILE_NUM_PROMPTS}"
+	LATENCY_WARMUP_ITERS="${PROFILE_LATENCY_WARMUP_ITERS}"
+
+	mkdir -p "${PROFILE_DIR}"
+
+	echo ""
+	echo "============================================="
+	echo "  PROFILING ENABLED (PROFILE=1)"
+	echo "============================================="
+	echo "  Profile dir:       ${PROFILE_DIR}"
+	echo "  Num prompts:       ${NUM_PROMPTS} (was PROFILE_NUM_PROMPTS)"
+	echo "  Latency warmups:   ${LATENCY_WARMUP_ITERS} (was PROFILE_LATENCY_WARMUP_ITERS)"
+	echo "  Latency iters:     IGNORED (vllm bench latency --profile runs"
+	echo "                     exactly 1 profiled iteration; see"
+	echo "                     vllm/benchmarks/latency.py:139-149)"
+	echo "  VLLM_RPC_TIMEOUT:  ${VLLM_RPC_TIMEOUT:-default}"
+	echo "  Trace viewer:      https://ui.perfetto.dev/"
+	echo "============================================="
+	echo ""
+fi
+
 # 04_pre_engine: snapshot immediately before the first vllm bench
 # launches the engine. If the engine init dies (as it has been doing),
 # this is the last clean "before" state we can compare the FAILURE
@@ -1635,6 +1777,21 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 
 			echo "  >> Latency: batch_size=${BATCH_SIZE}, input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}"
 
+			# Per-invocation profiler args. Each (bs, in, out) gets its
+			# own torch_profiler_dir so per-rank trace files (named
+			# rank_<N>.pt.trace.json.gz by TorchProfilerWrapper) don't
+			# collide across invocations. Empty array when PROFILE=0.
+			LATENCY_PROFILE_ARGS=()
+			if [[ "${PROFILE}" == "1" ]]; then
+				LATENCY_PROFILE_DIR="${PROFILE_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}"
+				mkdir -p "${LATENCY_PROFILE_DIR}"
+				LATENCY_PROFILE_ARGS=(
+					--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${LATENCY_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":false}"
+					--profile
+				)
+				echo "  >> Profiler traces -> ${LATENCY_PROFILE_DIR}"
+			fi
+
 			vllm bench latency \
 				"${ENGINE_ARGS[@]}" \
 				--batch-size "${BATCH_SIZE}" \
@@ -1643,6 +1800,7 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 				--num-iters-warmup "${LATENCY_WARMUP_ITERS}" \
 				--num-iters "${LATENCY_ITERS}" \
 				--output-json "${RESULT_FILE}" \
+				${LATENCY_PROFILE_ARGS[@]+"${LATENCY_PROFILE_ARGS[@]}"} \
 				2>&1 | tee "${LOG_FILE}"
 
 			echo "  >> Saved to ${RESULT_FILE}"
@@ -1671,6 +1829,24 @@ print_process_diagnostics_all_nodes "05_pre_vllm_serve"
 if [[ "${RUN_SERVING}" == "1" ]]; then
 	echo "[Step 5/6] Starting vLLM server and running serving benchmarks..."
 
+# Per-server profiler args. The server reads --profiler-config once at
+# launch and uses it for every /start_profile the bench client sends.
+# Because `vllm bench serve --profile` does not pass a profile_prefix
+# through /start_profile (vllm/benchmarks/serve.py:751-760), all
+# per-rate trace files land in the same directory, distinguished only
+# by trace timestamp. Acceptable: the bench client waits for
+# /stop_profile to return before issuing the next /start_profile, so
+# trace files from different rates do not interleave.
+SERVE_PROFILE_ARGS=()
+if [[ "${PROFILE}" == "1" ]]; then
+	SERVE_PROFILE_DIR="${PROFILE_DIR}/serving"
+	mkdir -p "${SERVE_PROFILE_DIR}"
+	SERVE_PROFILE_ARGS=(
+		--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${SERVE_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":false}"
+	)
+	echo "  Profiler traces -> ${SERVE_PROFILE_DIR}"
+fi
+
 # Start the vLLM server in the background.
 # Use a process group so we can cleanly kill the server and its children.
 vllm serve "${MODEL}" \
@@ -1685,6 +1861,7 @@ vllm serve "${MODEL}" \
 	--enforce-eager \
 	--host 0.0.0.0 \
 	--port "${SERVE_PORT}" \
+	${SERVE_PROFILE_ARGS[@]+"${SERVE_PROFILE_ARGS[@]}"} \
 	>"${RESULTS_DIR}/server.log" 2>&1 &
 
 SERVER_PID=$!
@@ -1755,6 +1932,14 @@ for IO_CONFIG in "${IO_CONFIGS[@]}"; do
 
 		echo ">> Serving: input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}, request_rate=${REQUEST_RATE}"
 
+		# Per-invocation --profile flag. Triggers the server's
+		# /start_profile and /stop_profile endpoints around this
+		# sweep iteration. Empty when PROFILE=0.
+		BENCH_SERVE_PROFILE_ARGS=()
+		if [[ "${PROFILE}" == "1" ]]; then
+			BENCH_SERVE_PROFILE_ARGS=(--profile)
+		fi
+
 		vllm bench serve \
 			--backend openai \
 			--base-url "${BASE_URL}" \
@@ -1772,6 +1957,7 @@ for IO_CONFIG in "${IO_CONFIGS[@]}"; do
 			--save-result \
 			--result-dir "${RESULTS_DIR}" \
 			--result-filename "${RESULT_LABEL}.json" \
+			${BENCH_SERVE_PROFILE_ARGS[@]+"${BENCH_SERVE_PROFILE_ARGS[@]}"} \
 			--metadata \
 			tp="${TP_SIZE}" \
 			pp="${PP_SIZE}" \
@@ -1828,6 +2014,20 @@ if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
 
 		echo "  >> Throughput: input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}"
 
+		# Per-invocation profiler args. Same per-config subdir pattern
+		# as Step 4 so trace files from different (in, out) shapes
+		# don't collide. Empty when PROFILE=0.
+		THROUGHPUT_PROFILE_ARGS=()
+		if [[ "${PROFILE}" == "1" ]]; then
+			THROUGHPUT_PROFILE_DIR="${PROFILE_DIR}/throughput_in${INPUT_LEN}_out${OUTPUT_LEN}"
+			mkdir -p "${THROUGHPUT_PROFILE_DIR}"
+			THROUGHPUT_PROFILE_ARGS=(
+				--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${THROUGHPUT_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":false}"
+				--profile
+			)
+			echo "  >> Profiler traces -> ${THROUGHPUT_PROFILE_DIR}"
+		fi
+
 		vllm bench throughput \
 			"${ENGINE_ARGS[@]}" \
 			--dataset-name random \
@@ -1835,6 +2035,7 @@ if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
 			--output-len "${OUTPUT_LEN}" \
 			--num-prompts "${NUM_PROMPTS}" \
 			--output-json "${RESULT_FILE}" \
+			${THROUGHPUT_PROFILE_ARGS[@]+"${THROUGHPUT_PROFILE_ARGS[@]}"} \
 			2>&1 | tee "${LOG_FILE}"
 
 		echo "  >> Saved to ${RESULT_FILE}"
@@ -1867,6 +2068,24 @@ ls -1 "${RESULTS_DIR}"/serving_*.json 2>/dev/null || echo "  (no serving JSON fi
 echo ""
 echo "Throughput results:"
 ls -1 "${RESULTS_DIR}"/throughput_*.json 2>/dev/null || echo "  (no throughput JSON files)"
+echo ""
+echo "Profiler traces:"
+if [[ "${PROFILE}" == "1" ]]; then
+	# List up to 20 per-rank trace files so the run log has an easy
+	# pointer. The full tree lives under ${PROFILE_DIR} if a submitter
+	# needs everything.
+	if [[ -d "${PROFILE_DIR}" ]]; then
+		echo "  Profile dir: ${PROFILE_DIR}"
+		find "${PROFILE_DIR}" -name '*.pt.trace.json*' 2>/dev/null | head -20 |
+			sed 's/^/    /' || echo "    (no trace files found)"
+		echo "  View traces directly at https://ui.perfetto.dev/"
+		echo "  (drag-and-drop any .pt.trace.json.gz file; no untar needed)"
+	else
+		echo "  (PROFILE=1 but ${PROFILE_DIR} was not created)"
+	fi
+else
+	echo "  (profiling disabled; submit with 'qsub -v PROFILE=1 ...' to enable)"
+fi
 echo ""
 echo "Metrics recorded:"
 echo "  - Offline latency:    end-to-end latency per (batch size, input length)"
