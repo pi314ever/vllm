@@ -12,10 +12,16 @@
 # 1h debug-scaling walltime.
 #
 # Submit:
-#   qsub qsub_polaris_deepseek_v3_latency_bs1.sh
+#   qsub qsub_polaris_deepseek_v3_latency.sh
 #
 # Submit-time overrides (qsub -v):
-#   qsub -v LATENCY_IO_CONFIGS_CSV=512:128,1024:4096 qsub_polaris_deepseek_v3_latency_bs1.sh
+#   qsub -v LATENCY_IO_CONFIGS_CSV=512:128,1024:4096 qsub_polaris_deepseek_v3_latency.sh
+#   qsub -v BACKEND=mp qsub_polaris_deepseek_v3_latency.sh
+#
+# Backend selection:
+#   BACKEND=ray (default) -> sources qsub_polaris_body.sh (Ray cluster).
+#   BACKEND=mp            -> sources qsub_polaris_body_mp.sh
+#                            (torch.distributed + MultiprocExecutor, no Ray).
 #
 # =============================================================================
 
@@ -41,6 +47,20 @@ export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-6000}"
 
+# Backend selection. Default is ray (matches pre-existing behaviour so
+# submitters with no BACKEND set see no change). Set BACKEND=mp to use
+# the multiprocessing body instead of the Ray body.
+BACKEND="${BACKEND:-ray}"
+case "${BACKEND}" in
+	ray) BODY_SCRIPT="qsub_polaris_body.sh" ;;
+	mp)  BODY_SCRIPT="qsub_polaris_body_mp.sh" ;;
+	*)
+		echo "ERROR: Unknown BACKEND=${BACKEND}. Expected 'ray' or 'mp'."
+		exit 1
+		;;
+esac
+
 # Shared body. Assumes this wrapper was submitted from the repo root so
-# PBS_O_WORKDIR resolves to the directory containing qsub_polaris_body.sh.
-source "${PBS_O_WORKDIR}/qsub_polaris_body.sh"
+# PBS_O_WORKDIR resolves to the directory containing the body scripts.
+# shellcheck source=/dev/null
+source "${PBS_O_WORKDIR}/${BODY_SCRIPT}"

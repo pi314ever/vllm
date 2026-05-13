@@ -21,6 +21,12 @@
 # Submit-time overrides (qsub -v; CSVs use commas, no spaces):
 #   qsub -v IO_CONFIGS_CSV=512:128,2048:256 qsub_polaris_deepseek_v3_throughput.sh
 #   qsub -v NUM_PROMPTS=500 qsub_polaris_deepseek_v3_throughput.sh
+#   qsub -v BACKEND=mp qsub_polaris_deepseek_v3_throughput.sh
+#
+# Backend selection:
+#   BACKEND=ray (default) -> sources qsub_polaris_body.sh (Ray cluster).
+#   BACKEND=mp            -> sources qsub_polaris_body_mp.sh
+#                            (torch.distributed + MultiprocExecutor, no Ray).
 #
 # =============================================================================
 
@@ -40,6 +46,20 @@ export RUN_LATENCY="${RUN_LATENCY:-0}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-1}"
 
+# Backend selection. Default is ray (matches pre-existing behaviour so
+# submitters with no BACKEND set see no change). Set BACKEND=mp to use
+# the multiprocessing body instead of the Ray body.
+BACKEND="${BACKEND:-ray}"
+case "${BACKEND}" in
+	ray) BODY_SCRIPT="qsub_polaris_body.sh" ;;
+	mp)  BODY_SCRIPT="qsub_polaris_body_mp.sh" ;;
+	*)
+		echo "ERROR: Unknown BACKEND=${BACKEND}. Expected 'ray' or 'mp'."
+		exit 1
+		;;
+esac
+
 # Shared body. Assumes this wrapper was submitted from the repo root so
-# PBS_O_WORKDIR resolves to the directory containing qsub_polaris_body.sh.
-source "${PBS_O_WORKDIR}/qsub_polaris_body.sh"
+# PBS_O_WORKDIR resolves to the directory containing the body scripts.
+# shellcheck source=/dev/null
+source "${PBS_O_WORKDIR}/${BODY_SCRIPT}"
