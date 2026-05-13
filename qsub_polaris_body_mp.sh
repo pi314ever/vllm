@@ -158,7 +158,7 @@ export TRITON_CACHE_MANAGER="${TRITON_CACHE_MANAGER:-triton.runtime.cache:FileCa
 # =============================================================================
 
 # Model configuration
-MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
+MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3/}"
 QUANTIZATION="${QUANTIZATION-}" # e.g. "fp8"; empty (default) disables --quantization
 DTYPE="${DTYPE:-auto}"
 
