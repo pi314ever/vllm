@@ -39,6 +39,7 @@ export LATENCY_IO_CONFIGS_CSV="${LATENCY_IO_CONFIGS_CSV:-1024:4096,4096:1024}"
 export RUN_LATENCY="${RUN_LATENCY:-1}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-6000}"
 
 # Shared body. Assumes this wrapper was submitted from the repo root so
 # PBS_O_WORKDIR resolves to the directory containing qsub_polaris_body.sh.
