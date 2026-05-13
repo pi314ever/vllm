@@ -163,7 +163,7 @@ export TRITON_CACHE_MANAGER="${TRITON_CACHE_MANAGER:-triton.runtime.cache:FileCa
 
 # Model configuration
 MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
-QUANTIZATION="${QUANTIZATION:-fp8}" # e.g. "fp8"; set to empty for no quantization
+QUANTIZATION="${QUANTIZATION-}" # e.g. "fp8"; empty (default) disables --quantization
 DTYPE="${DTYPE:-auto}"
 
 # Build conditional quantization args (used by ENGINE_ARGS and vllm serve)
