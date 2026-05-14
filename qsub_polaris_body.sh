@@ -287,8 +287,17 @@ SAMPLER_FLAG="${DIAG_DIR}/.sampler_run"
 # Server port for online serving benchmark
 SERVE_PORT="${SERVE_PORT:-8000}"
 
-# Max model length
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+# Max model length. Optional; empty (default) omits --max-model-len so vLLM
+# falls back to the model config's max_position_embeddings. Set to an int
+# (e.g. `qsub -v MAX_MODEL_LEN=4096 ...`) to cap context length, which
+# reduces KV-cache reservation and speeds up engine init on large models.
+MAX_MODEL_LEN="${MAX_MODEL_LEN-}"
+
+# Build conditional max-model-len args (used by ENGINE_ARGS and vllm serve)
+MAX_MODEL_LEN_ARGS=()
+if [[ -n "${MAX_MODEL_LEN}" ]]; then
+	MAX_MODEL_LEN_ARGS=(--max-model-len "${MAX_MODEL_LEN}")
+fi
 
 # Number of prompts / warmups for serving benchmark.
 # Sized to fit within Polaris's 1h debug-scaling queue walltime. Raise
@@ -728,7 +737,7 @@ echo "  TP size:        ${TP_SIZE}"
 echo "  PP size:        ${PP_SIZE}"
 echo "  EP size:        ${EP_SIZE} (derived: TP * DP, DP=1)"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
-echo "  Max model len:  ${MAX_MODEL_LEN}"
+echo "  Max model len:  ${MAX_MODEL_LEN:-model default}"
 echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
 echo "  Ray CPUs/node:  ${NUM_RAY_CPUS_PER_NODE} (caps ray::IDLE pool)"
 echo "  Cache root:     ${CACHE_ROOT}"
@@ -1670,7 +1679,7 @@ ENGINE_ARGS=(
 	--pipeline-parallel-size "${PP_SIZE}"
 	--enable-expert-parallel
 	--distributed-executor-backend ray
-	--max-model-len "${MAX_MODEL_LEN}"
+	${MAX_MODEL_LEN_ARGS[@]+"${MAX_MODEL_LEN_ARGS[@]}"}
 	--trust-remote-code
 	# --enforce-eager skips torch.compile AND CUDA graph capture.
 	# Required under Polaris's cgroup pids.max=4096 cap: CUDA graph
@@ -1865,7 +1874,7 @@ vllm serve "${MODEL}" \
 	--pipeline-parallel-size "${PP_SIZE}" \
 	--enable-expert-parallel \
 	--distributed-executor-backend ray \
-	--max-model-len "${MAX_MODEL_LEN}" \
+	${MAX_MODEL_LEN_ARGS[@]+"${MAX_MODEL_LEN_ARGS[@]}"} \
 	--trust-remote-code \
 	--enforce-eager \
 	--host 0.0.0.0 \

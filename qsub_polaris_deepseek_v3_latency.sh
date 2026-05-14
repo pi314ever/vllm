@@ -45,7 +45,6 @@ export LATENCY_IO_CONFIGS_CSV="${LATENCY_IO_CONFIGS_CSV:-1024:4096,4096:1024}"
 export RUN_LATENCY="${RUN_LATENCY:-1}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
-export MAX_MODEL_LEN="${MAX_MODEL_LEN:-6000}"
 
 # Backend selection. Default is ray (matches pre-existing behaviour so
 # submitters with no BACKEND set see no change). Set BACKEND=mp to use

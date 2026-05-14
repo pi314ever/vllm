@@ -267,8 +267,20 @@ SAMPLER_FLAG="${DIAG_DIR}/.sampler_run"
 # Server port for online serving benchmark.
 SERVE_PORT="${SERVE_PORT:-8000}"
 
-# Max model length.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+# Max model length. Optional; empty (default) omits --max-model-len so vLLM
+# falls back to the model config's max_position_embeddings. Set to an int
+# (e.g. `qsub -v MAX_MODEL_LEN=4096 ...`) to cap context length, which
+# reduces KV-cache reservation and speeds up engine init on large models.
+MAX_MODEL_LEN="${MAX_MODEL_LEN-}"
+
+# Build conditional max-model-len args (used by MP_COMMON_ENGINE_ARGS).
+# MUST match on head and every worker (MultiprocExecutor's VllmConfig
+# consistency check rejects the rendezvous otherwise); since this is
+# sourced once before launch_mp_workers, both sides pick up the same value.
+MAX_MODEL_LEN_ARGS=()
+if [[ -n "${MAX_MODEL_LEN}" ]]; then
+	MAX_MODEL_LEN_ARGS=(--max-model-len "${MAX_MODEL_LEN}")
+fi
 
 # Number of prompts / warmups for serving benchmark. Same sizing as the
 # Ray body.
@@ -460,7 +472,7 @@ echo "  TP size:        ${TP_SIZE}"
 echo "  PP size:        ${PP_SIZE}"
 echo "  EP size:        ${EP_SIZE} (derived: TP * DP, DP=1)"
 echo "  Expected GPUs:  ${EXPECTED_GPUS}"
-echo "  Max model len:  ${MAX_MODEL_LEN}"
+echo "  Max model len:  ${MAX_MODEL_LEN:-model default}"
 echo "  Threads/worker: ${NUM_THREADS_PER_WORKER} (OMP/BLAS/MKL/Rayon)"
 echo "  MP master:      ${HEAD_IP}:${MP_MASTER_PORT}"
 echo "  Cache root:     ${CACHE_ROOT}"
@@ -1392,7 +1404,7 @@ MP_COMMON_ENGINE_ARGS=(
 	--pipeline-parallel-size "${PP_SIZE}"
 	--enable-expert-parallel
 	--distributed-executor-backend mp
-	--max-model-len "${MAX_MODEL_LEN}"
+	${MAX_MODEL_LEN_ARGS[@]+"${MAX_MODEL_LEN_ARGS[@]}"}
 	--trust-remote-code
 	# --enforce-eager: same rationale as Ray body. Under Polaris's
 	# cgroup pids.max=4096 cap, CUDA graph capture's transient thread
