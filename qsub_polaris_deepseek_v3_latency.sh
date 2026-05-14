@@ -36,7 +36,7 @@
 
 # Config-specific overrides. All of these honor any qsub -v values the
 # user supplied, so the wrapper's defaults are "only if not overridden".
-export MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3-0324/}"
+export MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3/}"
 export BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1}"
 # (input:output) pairs, comma-separated. Matches Step 5/6 IO_CONFIGS_CSV
 # syntax. bs1 targets a long-context, long-generation interactive shape
