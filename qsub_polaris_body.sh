@@ -2300,6 +2300,13 @@ if [[ "${RUN_LM_EVAL}" == "1" ]]; then
 	# the reference DeepSeek-V3 accuracy command with our Polaris-tuned
 	# defaults substituted in.
 	#
+	# Both tensor_parallel_size and pipeline_parallel_size are forwarded
+	# unconditionally so the lm_eval engine matches the topology Steps
+	# 1-3 brought up on the Ray cluster. PP_SIZE=1 is a vLLM no-op, so
+	# pure-TP runs are unaffected. The PP_SIZE * TP_SIZE == EXPECTED_GPUS
+	# invariant is enforced upstream (qsub_polaris_body.sh:245), so no
+	# additional validation is needed here.
+	#
 	# NOTE: keep order stable for grep-friendly logging; the comma
 	# separator must NOT be followed by spaces (lm_eval's parser splits
 	# on bare commas only).
@@ -2307,6 +2314,7 @@ if [[ "${RUN_LM_EVAL}" == "1" ]]; then
 	LM_EVAL_MODEL_ARGS+=",trust_remote_code=True"
 	LM_EVAL_MODEL_ARGS+=",enforce_eager=True"
 	LM_EVAL_MODEL_ARGS+=",tensor_parallel_size=${TP_SIZE}"
+	LM_EVAL_MODEL_ARGS+=",pipeline_parallel_size=${PP_SIZE}"
 	LM_EVAL_MODEL_ARGS+=",max_num_batched_tokens=${LM_EVAL_MAX_NUM_BATCHED_TOKENS}"
 	if [[ -n "${MAX_MODEL_LEN}" ]]; then
 		LM_EVAL_MODEL_ARGS+=",max_model_len=${MAX_MODEL_LEN}"
