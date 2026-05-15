@@ -110,7 +110,7 @@ export RUN_LM_EVAL="${RUN_LM_EVAL:-1}"
 export LM_EVAL_TASKS="${LM_EVAL_TASKS:-gsm8k}"
 export LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT:-8}"
 export LM_EVAL_MAX_NUM_BATCHED_TOKENS="${LM_EVAL_MAX_NUM_BATCHED_TOKENS:-4096}"
-export LM_EVAL_MOE_BACKEND="${LM_EVAL_MOE_BACKEND:-cuda}"
+export LM_EVAL_MOE_BACKEND="${LM_EVAL_MOE_BACKEND:-marlin}"
 
 # Shared body. Assumes this wrapper was submitted from the repo root so
 # PBS_O_WORKDIR resolves to the directory containing the body scripts.
