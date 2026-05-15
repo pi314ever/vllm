@@ -41,6 +41,8 @@
 # Config-specific overrides. All of these honor any qsub -v values the
 # user supplied, so the wrapper's defaults are "only if not overridden".
 export MODEL="${MODEL:-/grand/Intel/dhuang/DeepSeek-V3/}"
+export IO_CONFIGS_CSV="${IO_CONFIGS_CSV:-1024:1024}"
+export REQUEST_RATES_CSV="${REQUEST_RATES_CSV:-inf}"
 export RUN_LATENCY="${RUN_LATENCY:-0}"
 export RUN_SERVING="${RUN_SERVING:-1}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"

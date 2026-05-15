@@ -1972,6 +1972,7 @@ done
 # strings (qsub -v friendly). IO shapes are "<input>:<output>" pairs.
 REQUEST_RATES_CSV="${REQUEST_RATES_CSV:-1,8,inf}"
 IO_CONFIGS_CSV="${IO_CONFIGS_CSV:-512:128,128:512}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
 IFS=',' read -r -a REQUEST_RATES <<<"${REQUEST_RATES_CSV}"
 IFS=',' read -r -a IO_CONFIGS    <<<"${IO_CONFIGS_CSV}"
 
@@ -2008,6 +2009,7 @@ for IO_CONFIG in "${IO_CONFIGS[@]}"; do
 			--dataset-name random \
 			--input-len "${INPUT_LEN}" \
 			--output-len "${OUTPUT_LEN}" \
+			--max-concurrency "${MAX_CONCURRENCY}" \
 			--num-prompts "${NUM_PROMPTS}" \
 			--num-warmups "${NUM_WARMUPS}" \
 			--request-rate "${REQUEST_RATE}" \
