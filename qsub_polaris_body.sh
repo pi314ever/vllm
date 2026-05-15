@@ -91,6 +91,31 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" && -z "${PBS_NODEFILE:-}" ]]; then
 	exit 1
 fi
 
+# =============================================================================
+# MULTI-INSTANCE PARTITIONING
+# =============================================================================
+# Two knobs that let multiple instances of this body run concurrently
+# inside a single PBS allocation, each owning a disjoint slice of nodes:
+#
+#   NODE_OFFSET     : index into the unique-hosts list parsed from
+#                     PBS_NODEFILE. The first node of THIS instance is
+#                     ALL_NODES[NODE_OFFSET]; the next NUM_NODES-1 nodes
+#                     after it are workers. Default 0 (single-instance
+#                     behaviour, head = first allocated node).
+#   INSTANCE_SUFFIX : string appended to every per-instance namespace
+#                     (RAY_TMPDIR, JOB_NAME, and everything that derives
+#                     from JOB_NAME: RUN_LOG_DIR, RESULTS_DIR, DIAG_DIR,
+#                     SAMPLER_FLAG, PROFILE_DIR). Default empty (single-
+#                     instance behaviour, paths use the bare PBS jobid).
+#
+# When sourcing/dispatching this body twice from a multi-instance wrapper,
+# set NODE_OFFSET and INSTANCE_SUFFIX to disjoint values per instance
+# (e.g. 0/"_A" and NUM_NODES/"_B"). All other shared state (caches on
+# /grand, ports on each head's local stack) is naturally disjoint because
+# each instance occupies different physical nodes.
+NODE_OFFSET="${NODE_OFFSET:-0}"
+INSTANCE_SUFFIX="${INSTANCE_SUFFIX:-}"
+
 export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"
 export ftp_proxy="http://proxy.alcf.anl.gov:3128"
@@ -225,7 +250,11 @@ fi
 # PBS on Polaris sets $TMPDIR to very long paths like:
 #   /var/tmp/pbs.7101514.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov/
 # which causes Ray socket paths to exceed the OS limit.
-RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${PBS_JOBID%%.*}}"
+#
+# INSTANCE_SUFFIX disambiguates concurrent instances inside one PBS job
+# (see MULTI-INSTANCE PARTITIONING block above). For single-instance
+# runs the suffix is empty and this resolves to the prior path.
+RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${PBS_JOBID%%.*}${INSTANCE_SUFFIX}}"
 export RAY_TMPDIR
 mkdir -p "${RAY_TMPDIR}"
 
@@ -247,11 +276,13 @@ export PBS_SHORT_JOBID
 #   logs/<job_name>/run.log         -> all stdout/stderr from this script
 #   logs/<job_name>/results/        -> RESULTS_DIR (benchmark outputs + diag)
 #
-# <job_name> = "${PBS_JOBNAME}.o${PBS_SHORT_JOBID}", matching PBS's own
-# default output file convention (<jobname>.o<jobid>) so a user scanning
-# `ls logs/` can correlate with the PBS job list easily while still
-# getting per-run history (no cross-run overwrites).
-JOB_NAME="${JOB_NAME:-${PBS_JOBNAME:-vllm-bench}.o${PBS_SHORT_JOBID}}"
+# <job_name> = "${PBS_JOBNAME}.o${PBS_SHORT_JOBID}${INSTANCE_SUFFIX}",
+# matching PBS's own default output file convention (<jobname>.o<jobid>)
+# so a user scanning `ls logs/` can correlate with the PBS job list
+# easily while still getting per-run history (no cross-run overwrites).
+# INSTANCE_SUFFIX (default empty) disambiguates concurrent instances
+# inside one PBS job (see MULTI-INSTANCE PARTITIONING block above).
+JOB_NAME="${JOB_NAME:-${PBS_JOBNAME:-vllm-bench}.o${PBS_SHORT_JOBID}${INSTANCE_SUFFIX}}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${PBS_O_WORKDIR:-.}/logs/${JOB_NAME}}"
 mkdir -p "${RUN_LOG_DIR}"
 
@@ -654,18 +685,28 @@ if [[ -z "${PBS_NODEFILE:-}" ]]; then
 fi
 
 # Get unique hostnames preserving PBS allocation order.
-# PBS runs this script on the first node, so ALL_NODES[0] is the head.
+# PBS runs this script on the first node by default, so ALL_NODES[0] is
+# the natural head for single-instance runs (NODE_OFFSET=0). Multi-
+# instance wrappers dispatch the body onto the per-instance head via
+# mpiexec so non-zero NODE_OFFSETs still resolve correctly.
 mapfile -t ALL_NODES < <(awk '!seen[$0]++' "${PBS_NODEFILE}")
 
-if [[ "${#ALL_NODES[@]}" -lt "${NUM_NODES}" ]]; then
-	echo "ERROR: Expected ${NUM_NODES} nodes, but PBS allocated ${#ALL_NODES[@]}:"
+# Total nodes this body needs from the allocation = NUM_NODES at the
+# given NODE_OFFSET. Multi-instance wrappers may allocate more than
+# NUM_NODES total (e.g. select=12, two instances of NUM_NODES=6); the
+# guard below only checks that THIS instance's slice exists.
+REQUIRED_NODES=$((NODE_OFFSET + NUM_NODES))
+if [[ "${#ALL_NODES[@]}" -lt "${REQUIRED_NODES}" ]]; then
+	echo "ERROR: Need ${REQUIRED_NODES} unique nodes (NODE_OFFSET=${NODE_OFFSET} + NUM_NODES=${NUM_NODES}),"
+	echo "       but PBS allocated ${#ALL_NODES[@]}:"
 	printf "  %s\n" "${ALL_NODES[@]}"
 	exit 1
 fi
 
-HEAD_HOST="${ALL_NODES[0]}"
-# Take exactly NUM_NODES-1 workers (ignore any extra nodes PBS allocated).
-WORKER_HOSTS=("${ALL_NODES[@]:1:$((NUM_NODES - 1))}")
+HEAD_HOST="${ALL_NODES[NODE_OFFSET]}"
+# Take exactly NUM_NODES-1 workers starting one slot past HEAD_HOST.
+# Slice form: "${ARR[@]:start:count}" -> elements [start, start+count).
+WORKER_HOSTS=("${ALL_NODES[@]:$((NODE_OFFSET + 1)):$((NUM_NODES - 1))}")
 
 # -----------------------------------------------------------------------------
 # IP resolution
@@ -727,6 +768,7 @@ echo "============================================="
 echo "  PBS ${NUM_NODES}-Node DeepSeek-R1 Benchmark"
 echo "============================================="
 echo "  Job ID:         ${PBS_JOBID:-N/A}"
+echo "  Instance:       offset=${NODE_OFFSET} suffix=${INSTANCE_SUFFIX:-<none>}"
 echo "  Head node:      ${HEAD_HOST} (${HEAD_IP})"
 for i in "${!WORKER_HOSTS[@]}"; do
 	printf "  Worker %-9s %s (%s)\n" "$((i + 1)):" "${WORKER_HOSTS[$i]}" "${WORKER_IPS[$i]}"
