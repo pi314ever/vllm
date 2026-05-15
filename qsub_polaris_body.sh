@@ -2315,6 +2315,17 @@ if [[ "${RUN_LM_EVAL}" == "1" ]]; then
 	LM_EVAL_MODEL_ARGS+=",enforce_eager=True"
 	LM_EVAL_MODEL_ARGS+=",tensor_parallel_size=${TP_SIZE}"
 	LM_EVAL_MODEL_ARGS+=",pipeline_parallel_size=${PP_SIZE}"
+	# Pin the distributed executor to Ray. lm-eval-harness's vllm wrapper
+	# spawns vllm.LLM(...) inside the lm_eval driver process, which on a
+	# multi-node Polaris allocation is a Ray client (Steps 1-3 brought
+	# the cluster up and exported RAY_ADDRESS). vLLM's auto-detection of
+	# the executor backend can pick MultiprocExecutor when it sees a
+	# single host's GPUs, so we force `distributed_executor_backend=ray`
+	# explicitly to guarantee the engine attaches to the existing Ray
+	# cluster and uses all NUM_NODES * GPUS_PER_NODE GPUs (matches the
+	# `--distributed-executor-backend ray` flag used by Steps 4/5/6's
+	# vllm bench CLIs at qsub_polaris_body.sh:1810,2020).
+	LM_EVAL_MODEL_ARGS+=",distributed_executor_backend=ray"
 	LM_EVAL_MODEL_ARGS+=",max_num_batched_tokens=${LM_EVAL_MAX_NUM_BATCHED_TOKENS}"
 	if [[ -n "${MAX_MODEL_LEN}" ]]; then
 		LM_EVAL_MODEL_ARGS+=",max_model_len=${MAX_MODEL_LEN}"

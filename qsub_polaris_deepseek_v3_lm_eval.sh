@@ -21,6 +21,7 @@
 #     --model_args pretrained=/grand/Intel/dhuang/DeepSeek-V3/, \
 #                  trust_remote_code=True,enforce_eager=True, \
 #                  tensor_parallel_size=4,pipeline_parallel_size=6, \
+#                  distributed_executor_backend=ray, \
 #                  max_num_batched_tokens=4096,max_model_len=4096, \
 #                  moe_backend=marlin,enable_expert_parallel=True \
 #     --tasks gsm8k --num_fewshot 8
