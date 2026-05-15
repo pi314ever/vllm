@@ -258,6 +258,25 @@ RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${PBS_JOBID%%.*}${INSTANCE_SUFFIX}}"
 export RAY_TMPDIR
 mkdir -p "${RAY_TMPDIR}"
 
+# Same fix shape for vLLM's ZMQ IPC sockets. vllm/utils/network_utils.py's
+# get_open_zmq_ipc_path() builds:
+#     ipc://${VLLM_RPC_BASE_PATH}/<uuid4>
+# and VLLM_RPC_BASE_PATH defaults to tempfile.gettempdir(), which on
+# PBS-Polaris reads $TMPDIR (the same long /var/tmp/pbs.<jobid>.<long-host>/
+# <uuid>/tmp/ path that broke Ray). Appending /<uuid4> (37 chars) blows
+# past the kernel's 107-byte sockaddr_un.sun_path limit and zmq.bind()
+# rejects it with:
+#     ZMQError: ipc path "..." is longer than 107 characters
+# (zmq.IPC_PATH_MAX_LEN). This bites `vllm bench latency` because it runs
+# in offline mode (client_local_only=True) and so the engine-client
+# address comes from get_open_zmq_ipc_path() rather than a TCP URI.
+#
+# Pinning a short, job-scoped base path here keeps the socket name well
+# under the limit (e.g. /tmp/vllm_rpc_7158834_A/<uuid> ~ 60 chars).
+VLLM_RPC_BASE_PATH="${VLLM_RPC_BASE_PATH:-/tmp/vllm_rpc_${PBS_JOBID%%.*}${INSTANCE_SUFFIX}}"
+export VLLM_RPC_BASE_PATH
+mkdir -p "${VLLM_RPC_BASE_PATH}"
+
 # GPU visibility: expose GPUS_PER_NODE devices per node (0,1,...,N-1)
 _default_cvd="$(seq -s, 0 $((GPUS_PER_NODE - 1)))"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${_default_cvd}}"
@@ -836,6 +855,21 @@ cleanup() {
 		for WHOST in "${WORKER_HOSTS[@]}"; do
 			mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
 				"rm -rf '${RAY_TMPDIR}'" 2>/dev/null || true
+		done
+	fi
+
+	# Clean up the vLLM RPC IPC socket directory on all nodes. vLLM
+	# normally unlinks its own sockets, but a crashed engine can leave
+	# stale entries; remove the whole job-scoped dir defensively. Only
+	# the head ever opens sockets here today, but the worker sweep is
+	# cheap and future-proofs against engine processes that bind on
+	# the workers (e.g. multi-engine setups).
+	if [[ -n "${VLLM_RPC_BASE_PATH:-}" ]]; then
+		echo "  Removing vLLM RPC base dir ${VLLM_RPC_BASE_PATH}..."
+		rm -rf "${VLLM_RPC_BASE_PATH}" 2>/dev/null || true
+		for WHOST in "${WORKER_HOSTS[@]}"; do
+			mpiexec -n 1 --ppn 1 --hosts "${WHOST}" -- bash -c \
+				"rm -rf '${VLLM_RPC_BASE_PATH}'" 2>/dev/null || true
 		done
 	fi
 

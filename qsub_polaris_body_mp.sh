@@ -154,6 +154,30 @@ mkdir -p "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${VLLM_CACHE_ROOT}"
 export TRITON_CACHE_MANAGER="${TRITON_CACHE_MANAGER:-triton.runtime.cache:FileCacheManager}"
 
 # =============================================================================
+# SHORT vLLM RPC IPC BASE PATH (AF_UNIX 107-byte limit workaround)
+# =============================================================================
+# vllm/utils/network_utils.py's get_open_zmq_ipc_path() builds:
+#     ipc://${VLLM_RPC_BASE_PATH}/<uuid4>
+# and VLLM_RPC_BASE_PATH defaults to tempfile.gettempdir(), which on
+# PBS-Polaris reads $TMPDIR=/var/tmp/pbs.<jobid>.<long-host>/<uuid>/tmp/
+# (~100 chars). Appending /<uuid4> (37 chars) blows past the kernel's
+# 107-byte sockaddr_un.sun_path limit and zmq.bind() rejects it with:
+#     ZMQError: ipc path "..." is longer than 107 characters
+# (zmq.IPC_PATH_MAX_LEN). This bites `vllm bench latency` because it
+# runs in offline mode (client_local_only=True) and so the engine-client
+# address comes from get_open_zmq_ipc_path() rather than a TCP URI.
+#
+# Pinning a short, job-scoped base path here keeps the socket name well
+# under the limit (e.g. /tmp/vllm_rpc_7158834/<uuid> ~ 60 chars).
+# INSTANCE_SUFFIX is honored for parity with the Ray body even though
+# this MP body does not currently support multi-instance partitioning;
+# it defaults to empty for the single-instance case.
+INSTANCE_SUFFIX="${INSTANCE_SUFFIX:-}"
+VLLM_RPC_BASE_PATH="${VLLM_RPC_BASE_PATH:-/tmp/vllm_rpc_${PBS_JOBID%%.*}${INSTANCE_SUFFIX}}"
+export VLLM_RPC_BASE_PATH
+mkdir -p "${VLLM_RPC_BASE_PATH}"
+
+# =============================================================================
 # USER CONFIGURATION
 # =============================================================================
 
@@ -542,6 +566,18 @@ cleanup() {
 			"pkill -f 'vllm serve.*--headless' 2>/dev/null || true" \
 			2>/dev/null || true
 	done
+
+	# Clean up the vLLM RPC IPC socket directory on all nodes. vLLM
+	# normally unlinks its own sockets, but a crashed engine can leave
+	# stale entries; remove the whole job-scoped dir defensively.
+	if [[ -n "${VLLM_RPC_BASE_PATH:-}" ]]; then
+		echo "  Removing vLLM RPC base dir ${VLLM_RPC_BASE_PATH}..."
+		rm -rf "${VLLM_RPC_BASE_PATH}" 2>/dev/null || true
+		for whost in "${WORKER_HOSTS[@]}"; do
+			mpiexec -n 1 --ppn 1 --hosts "${whost}" -- bash -c \
+				"rm -rf '${VLLM_RPC_BASE_PATH}'" 2>/dev/null || true
+		done
+	fi
 
 	echo "Cleanup complete."
 }
