@@ -1994,6 +1994,21 @@ if [[ "${PROFILE}" == "1" ]]; then
 	echo "  Profiler traces -> ${SERVE_PROFILE_DIR}"
 fi
 
+# Pre-flight: refuse to start if ${SERVE_PORT} is already in LISTEN state
+# on the head node. vLLM sets SO_REUSEPORT on the API-server socket
+# (vllm/entrypoints/openai/api_server.py:503), so a stale listener (e.g.
+# from a prior failed run on the same head node) would silently share
+# the port and answer benchmark traffic on our behalf, while our new
+# server stays bound-but-not-listening for the entire ~15 min model
+# load. There is no readiness probe that can recover from this once it
+# has happened, so we fail fast here instead.
+if ss -ltn "sport = :${SERVE_PORT}" 2>/dev/null | grep -q LISTEN; then
+	echo "ERROR: Port ${SERVE_PORT} already in LISTEN state on $(hostname)."
+	echo "       Refusing to start vLLM serve to avoid SO_REUSEPORT collision."
+	ss -ltnp "sport = :${SERVE_PORT}" 2>/dev/null || true
+	exit 1
+fi
+
 # Start the vLLM server in the background.
 # Use a process group so we can cleanly kill the server and its children.
 vllm serve "${MODEL}" \
@@ -2014,11 +2029,29 @@ vllm serve "${MODEL}" \
 SERVER_PID=$!
 echo "vLLM server starting in background (PID ${SERVER_PID})..."
 
-# Wait for server readiness
+# Wait for server readiness via a two-stage probe:
+#   Stage 1: poll GET /health until 200. /health is gated by
+#     AsyncLLM.check_health (vllm/v1/engine/async_llm.py:866-869) and
+#     only becomes reachable once uvicorn starts serving in
+#     build_and_serve() (vllm/entrypoints/openai/api_server.py:604,
+#     vllm/entrypoints/launcher.py:82), which runs only after engine
+#     init + KV cache alloc + warmup are complete on every Ray worker
+#     (vllm/v1/engine/core.py:116, 126, 1411-1416). curl -f rejects
+#     5xx, so a 503 from EngineDeadError is treated as not-ready.
+#   Stage 2: confirm we are actually talking to OUR engine (not a
+#     stale SO_REUSEPORT-shadowed listener that pre-flight didn't
+#     catch) by generating one real token. Same shape of probe as
+#     vllm/benchmarks/lib/ready_checker.py:18-79 uses internally when
+#     --ready-check-timeout-sec > 0.
+#
+# MAX_WAIT=1800: DeepSeek-V3 cold-start on Polaris (lustre first-touch)
+# observed at ~893s (model load + init engine + warmup); warm-cache
+# runs land closer to ~5 min. 30 min ceiling leaves ~25 min of the 1h
+# walltime for the sweep + cleanup.
 BASE_URL="http://localhost:${SERVE_PORT}"
-echo "Waiting for server to be ready at ${BASE_URL}/v1/models ..."
+echo "Waiting for server to be ready at ${BASE_URL}/health ..."
 
-MAX_WAIT=600
+MAX_WAIT=1800
 ELAPSED=0
 SERVER_POLL_INTERVAL=10
 
@@ -2026,24 +2059,38 @@ while true; do
 	# Check if the server process is still alive
 	if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
 		echo "ERROR: vLLM server process died unexpectedly."
+		tail -n 100 "${RESULTS_DIR}/server.log" 2>/dev/null || true
 		wait "${SERVER_PID}" || true
 		exit 1
 	fi
 
-	if curl -s --max-time 5 "${BASE_URL}/v1/models" >/dev/null 2>&1; then
-		echo "Server is ready!"
+	if curl -fsS --max-time 5 "${BASE_URL}/health" >/dev/null 2>&1; then
+		echo "Server /health passed."
 		break
 	fi
 
 	ELAPSED=$((ELAPSED + SERVER_POLL_INTERVAL))
 	if [[ "${ELAPSED}" -ge "${MAX_WAIT}" ]]; then
-		echo "ERROR: Server not ready after ${MAX_WAIT}s."
+		echo "ERROR: Server /health not 200 after ${MAX_WAIT}s."
+		tail -n 100 "${RESULTS_DIR}/server.log" 2>/dev/null || true
 		exit 1
 	fi
 
 	echo "  Not ready yet... retrying in ${SERVER_POLL_INTERVAL}s (${ELAPSED}s elapsed)"
 	sleep "${SERVER_POLL_INTERVAL}"
 done
+
+# Stage 2: prove we're talking to OUR engine by generating one token.
+echo "Validating engine via POST /v1/completions (max_tokens=1)..."
+if ! curl -fsS --max-time 30 \
+	-H 'Content-Type: application/json' \
+	-d "{\"model\": \"${MODEL}\", \"prompt\": \".\", \"max_tokens\": 1, \"temperature\": 0}" \
+	"${BASE_URL}/v1/completions" >/dev/null; then
+	echo "ERROR: Probe POST /v1/completions failed."
+	tail -n 100 "${RESULTS_DIR}/server.log" 2>/dev/null || true
+	exit 1
+fi
+echo "Server is ready!"
 
 # --- Run the serving benchmark sweep ---
 #
