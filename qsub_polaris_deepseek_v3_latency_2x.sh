@@ -71,6 +71,7 @@ export BATCH_SIZES_CSV="${BATCH_SIZES_CSV:-1}"
 export RUN_LATENCY="${RUN_LATENCY:-1}"
 export RUN_SERVING="${RUN_SERVING:-0}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
+export RUN_LM_EVAL="${RUN_LM_EVAL:-0}"
 
 # -----------------------------------------------------------------------------
 # Per-instance configuration. Only LATENCY_IO_CONFIGS_CSV differs.
@@ -170,6 +171,7 @@ dispatch_instance() {
 		export RUN_LATENCY='${RUN_LATENCY}'
 		export RUN_SERVING='${RUN_SERVING}'
 		export RUN_THROUGHPUT='${RUN_THROUGHPUT}'
+		export RUN_LM_EVAL='${RUN_LM_EVAL}'
 
 		# PBS context the body reads. PBS_O_WORKDIR is needed for the
 		# 'source \"\${PBS_O_WORKDIR}/\${BODY_SCRIPT}\"' pattern used

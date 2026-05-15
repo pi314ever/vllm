@@ -28,8 +28,11 @@
 #   4. Optionally start vLLM API server and run serving benchmarks
 #      (Step 5; RUN_SERVING=1).
 #   5. Optionally run offline throughput benchmarks (Step 6; RUN_THROUGHPUT=1).
-#   6. Clean up Ray on all nodes on exit.
-#   7. Optionally wrap every bench invocation with the torch profiler and
+#   6. Optionally run lm-evaluation-harness accuracy benchmarks (Step 7;
+#      RUN_LM_EVAL=1). lm_eval drives a vllm.LLM(...) inside its own
+#      vllm wrapper; the existing Ray cluster is reused via RAY_ADDRESS.
+#   7. Clean up Ray on all nodes on exit.
+#   8. Optionally wrap every bench invocation with the torch profiler and
 #      emit Perfetto-viewable traces (PROFILE=1). See the PROFILING CONFIG
 #      block below for knobs and trade-offs.
 #
@@ -86,6 +89,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" && -z "${PBS_NODEFILE:-}" ]]; then
 	echo "         qsub qsub_polaris_deepseek_v3_latency_bs32.sh"
 	echo "         qsub qsub_polaris_deepseek_v3_serving.sh"
 	echo "         qsub qsub_polaris_deepseek_v3_throughput.sh"
+	echo "         qsub qsub_polaris_deepseek_v3_lm_eval.sh"
 	echo "       Or submit the whole suite:"
 	echo "         for f in qsub_polaris_deepseek_v3_*.sh; do qsub \"\$f\"; done"
 	exit 1
@@ -358,19 +362,59 @@ NUM_WARMUPS="${NUM_WARMUPS:-2}"
 # =============================================================================
 # BENCHMARK STEP GATES
 # =============================================================================
-# Each of Steps 4, 5, 6 can be independently turned on or off by the
+# Each of Steps 4, 5, 6, 7 can be independently turned on or off by the
 # wrapper. A wrapper that only wants the latency sweep sets
-# RUN_LATENCY=1, RUN_SERVING=0, RUN_THROUGHPUT=0 before `source`ing
-# this body. Defaults leave latency + serving on (matches the pre-
-# refactor monolith) and throughput off (it's new and opt-in).
+# RUN_LATENCY=1, RUN_SERVING=0, RUN_THROUGHPUT=0, RUN_LM_EVAL=0 before
+# `source`ing this body. Defaults leave latency + serving on (matches
+# the pre-refactor monolith), throughput off (it's opt-in), and lm_eval
+# off (added later for accuracy benchmarks; opt-in via the dedicated
+# qsub_polaris_deepseek_v3_lm_eval.sh wrapper).
 #
 # Steps 1-3 (Ray cluster bring-up and 00-04 diagnostics) always run;
-# a benchmark job that disables all three RUN_* knobs still brings up
+# a benchmark job that disables all four RUN_* knobs still brings up
 # the cluster and takes process-limit snapshots, which is useful for
 # pure infrastructure debugging.
 RUN_LATENCY="${RUN_LATENCY:-1}"
 RUN_SERVING="${RUN_SERVING:-1}"
 RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
+RUN_LM_EVAL="${RUN_LM_EVAL:-0}"
+
+# -----------------------------------------------------------------------------
+# Step 7: lm-evaluation-harness (accuracy) configuration
+# -----------------------------------------------------------------------------
+# Only consulted when RUN_LM_EVAL=1 (default 0). Defaults reproduce the
+# DeepSeek-V3 reference accuracy benchmark:
+#   lm_eval --model vllm \
+#     --model_args pretrained=...,trust_remote_code=True,enforce_eager=True,
+#                  tensor_parallel_size=...,max_num_batched_tokens=4096,
+#                  max_model_len=4096,moe_backend=triton,
+#                  enable_expert_parallel=True \
+#     --tasks gsm8k --limit 128 --num_fewshot 8
+# MODEL, TP_SIZE and MAX_MODEL_LEN are sourced from the body's top-level
+# config (so a single qsub -v override updates the Ray cluster sizing
+# AND the lm_eval engine). Everything below is lm_eval-specific.
+#
+# LM_EVAL_TASKS              : comma-separated lm-eval-harness task list.
+# LM_EVAL_LIMIT              : per-task example cap. Empty/unset (default)
+#                              passes no --limit flag to lm_eval, which
+#                              evaluates the full task split. Set to an
+#                              int (e.g. `qsub -v LM_EVAL_LIMIT=128`) for
+#                              a quick smoke run; lm_eval also accepts a
+#                              float in (0,1) for fractional caps.
+# LM_EVAL_NUM_FEWSHOT        : few-shot context count.
+# LM_EVAL_MAX_NUM_BATCHED_TOKENS : engine batch budget. Bounded above
+#                              by MAX_MODEL_LEN to keep prefill within
+#                              KV cache.
+# LM_EVAL_MOE_BACKEND        : MoE kernel backend. vLLM auto-selects
+#                              the CUDA backend on A100 (faster), but
+#                              the reference command pins triton; keep
+#                              the reference default to make Polaris
+#                              numbers comparable to other sites.
+LM_EVAL_TASKS="${LM_EVAL_TASKS:-gsm8k}"
+LM_EVAL_LIMIT="${LM_EVAL_LIMIT-}"
+LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT:-8}"
+LM_EVAL_MAX_NUM_BATCHED_TOKENS="${LM_EVAL_MAX_NUM_BATCHED_TOKENS:-4096}"
+LM_EVAL_MOE_BACKEND="${LM_EVAL_MOE_BACKEND:-triton}"
 
 # =============================================================================
 # PROFILING CONFIG
@@ -1489,7 +1533,7 @@ trap _diag_on_err ERR
 # =============================================================================
 
 echo ""
-echo "[Step 1/5] Starting Ray head node on ${HEAD_HOST} (${HEAD_IP}:${RAY_PORT})..."
+echo "[Step 1/7] Starting Ray head node on ${HEAD_HOST} (${HEAD_IP}:${RAY_PORT})..."
 
 # VLLM_HOST_IP MUST match the IP Ray registers the node under (--node-ip-address
 # below); otherwise vLLM's placement-group request `node:<VLLM_HOST_IP>: 0.001`
@@ -1550,7 +1594,7 @@ echo "Exported RAY_ADDRESS=${RAY_ADDRESS} for vLLM subprocesses."
 # =============================================================================
 
 echo ""
-echo "[Step 2/5] Starting Ray workers on ${#WORKER_HOSTS[@]} node(s): ${WORKER_HOSTS[*]}"
+echo "[Step 2/7] Starting Ray workers on ${#WORKER_HOSTS[@]} node(s): ${WORKER_HOSTS[*]}"
 
 # 02_head_ray_up: snapshot AFTER the head-node ray start completes but
 # BEFORE any worker joins. Isolates the head-only Ray infrastructure
@@ -1703,7 +1747,7 @@ echo "Worker mpiexec sessions launched (PIDs: ${WORKER_PIDS[*]})"
 # =============================================================================
 
 echo ""
-echo "[Step 3/5] Waiting for ${EXPECTED_NODES} nodes (${EXPECTED_GPUS} GPUs) to join..."
+echo "[Step 3/7] Waiting for ${EXPECTED_NODES} nodes (${EXPECTED_GPUS} GPUs) to join..."
 
 POLL_INTERVAL=10
 ELAPSED=0
@@ -1865,7 +1909,7 @@ start_background_sampler
 
 if [[ "${RUN_LATENCY}" == "1" ]]; then
 	echo ""
-	echo "[Step 4/6] Running offline latency benchmarks..."
+	echo "[Step 4/7] Running offline latency benchmarks..."
 	echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
 	echo "  Sweep: batch_sizes=[${BATCH_SIZES[*]}] io_configs=[${LATENCY_IO_CONFIGS[*]}]"
 	echo ""
@@ -1914,7 +1958,7 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 	echo "Offline latency benchmarks complete."
 	echo ""
 else
-	echo "[Step 4/6] Skipping offline latency benchmarks (RUN_LATENCY=${RUN_LATENCY})."
+	echo "[Step 4/7] Skipping offline latency benchmarks (RUN_LATENCY=${RUN_LATENCY})."
 	echo ""
 fi
 
@@ -1930,7 +1974,7 @@ print_process_diagnostics_all_nodes "05_pre_vllm_serve"
 # =============================================================================
 
 if [[ "${RUN_SERVING}" == "1" ]]; then
-	echo "[Step 5/6] Starting vLLM server and running serving benchmarks..."
+	echo "[Step 5/7] Starting vLLM server and running serving benchmarks..."
 
 # Per-server profiler args. The server reads --profiler-config once at
 # launch and uses it for every /start_profile the bench client sends.
@@ -2082,7 +2126,7 @@ echo "Online serving benchmarks complete."
 echo ""
 
 else
-	echo "[Step 5/6] Skipping online serving benchmarks (RUN_SERVING=${RUN_SERVING})."
+	echo "[Step 5/7] Skipping online serving benchmarks (RUN_SERVING=${RUN_SERVING})."
 	echo ""
 fi
 
@@ -2104,7 +2148,7 @@ fi
 # with Steps 4/5 via ENGINE_ARGS.
 
 if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
-	echo "[Step 6/6] Running offline throughput benchmarks..."
+	echo "[Step 6/7] Running offline throughput benchmarks..."
 	echo "  Engine config: PP=${PP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}"
 	echo "  Sweep: io_configs=[${IO_CONFIGS[*]}]"
 	echo ""
@@ -2150,7 +2194,132 @@ if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
 	echo "Offline throughput benchmarks complete."
 	echo ""
 else
-	echo "[Step 6/6] Skipping offline throughput benchmarks (RUN_THROUGHPUT=${RUN_THROUGHPUT})."
+	echo "[Step 6/7] Skipping offline throughput benchmarks (RUN_THROUGHPUT=${RUN_THROUGHPUT})."
+	echo ""
+fi
+
+# =============================================================================
+# STEP 7: lm-evaluation-harness Accuracy Benchmark
+# =============================================================================
+# `lm_eval --model vllm` instantiates a vllm.LLM(...) inside lm-eval-
+# harness's vllm wrapper (`lm_eval/models/vllm_causallms.py`). The LLM
+# auto-detects the existing Ray cluster via RAY_ADDRESS (exported in
+# Step 1) and runs a TP=${TP_SIZE} engine across all ${EXPECTED_GPUS}
+# GPUs. lm_eval then drives one logits / generation request per few-shot
+# example through the LLM's generate() API and scores the responses
+# against the task harness.
+#
+# Differences vs. Steps 4/5/6:
+#   - lm_eval owns the engine lifecycle. We do NOT pass ENGINE_ARGS;
+#     instead we build a comma-separated --model_args string that
+#     lm_eval forwards verbatim to vllm.LLM(...). MODEL, TP_SIZE,
+#     MAX_MODEL_LEN, etc. are sourced from the body's top-level config
+#     so a single qsub -v override updates both the Ray cluster sizing
+#     AND the lm_eval engine.
+#   - PROFILE=1 is NOT wired through here: lm_eval has no
+#     --profiler-config / --profile flag, so trace capture would
+#     require extending lm-eval-harness's vllm wrapper. Out of scope
+#     for the accuracy job; profile a generate() invocation via
+#     Step 4 / 6 if you need traces.
+#
+# Knobs (see BENCHMARK STEP GATES section): LM_EVAL_TASKS,
+# LM_EVAL_LIMIT, LM_EVAL_NUM_FEWSHOT, LM_EVAL_MAX_NUM_BATCHED_TOKENS,
+# LM_EVAL_MOE_BACKEND.
+
+if [[ "${RUN_LM_EVAL}" == "1" ]]; then
+	echo "[Step 7/7] Running lm-evaluation-harness accuracy sweep..."
+	echo ""
+
+	# Ensure lm-eval is installed in the venv. Idempotent: skips the
+	# install if the package is already present so warm jobs don't pay
+	# the pip resolution cost. The body does NOT auto-install vllm or
+	# ray (matches the existing convention); we handle lm_eval here
+	# because its dependency footprint is small and bundling it with
+	# the wrapper avoids requiring submitters to remember a manual
+	# install step.
+	if ! python -c "import lm_eval" 2>/dev/null; then
+		echo "  Installing lm-eval into ${VENV_DIR}..."
+		uv pip install -q lm-eval
+	fi
+
+	# Snapshot per-node thread/pid state immediately before lm_eval
+	# spawns the LLM. Mirrors the 04_pre_engine snapshot taken before
+	# Steps 4/5/6 -- gives us a clean "before" diagnostic for the
+	# RUN_LM_EVAL=1 path.
+	print_process_diagnostics_all_nodes "07_pre_lm_eval"
+
+	# Build lm_eval --model_args. Comma-separated key=value pairs that
+	# lm_eval's vllm wrapper passes straight to vllm.LLM(...). Mirrors
+	# the reference DeepSeek-V3 accuracy command with our Polaris-tuned
+	# defaults substituted in.
+	#
+	# NOTE: keep order stable for grep-friendly logging; the comma
+	# separator must NOT be followed by spaces (lm_eval's parser splits
+	# on bare commas only).
+	LM_EVAL_MODEL_ARGS="pretrained=${MODEL}"
+	LM_EVAL_MODEL_ARGS+=",trust_remote_code=True"
+	LM_EVAL_MODEL_ARGS+=",enforce_eager=True"
+	LM_EVAL_MODEL_ARGS+=",tensor_parallel_size=${TP_SIZE}"
+	LM_EVAL_MODEL_ARGS+=",max_num_batched_tokens=${LM_EVAL_MAX_NUM_BATCHED_TOKENS}"
+	if [[ -n "${MAX_MODEL_LEN}" ]]; then
+		LM_EVAL_MODEL_ARGS+=",max_model_len=${MAX_MODEL_LEN}"
+	fi
+	LM_EVAL_MODEL_ARGS+=",moe_backend=${LM_EVAL_MOE_BACKEND}"
+	LM_EVAL_MODEL_ARGS+=",enable_expert_parallel=True"
+
+	# Sanitize the comma-separated task list for use as a filename
+	# fragment ("gsm8k,arc_easy" -> "gsm8k_arc_easy"). Result-label
+	# also encodes limit / few-shot so re-runs with different sweep
+	# parameters don't overwrite each other's logs. When LM_EVAL_LIMIT
+	# is empty the run targets the full task split; we encode that as
+	# "limfull" so the resulting filename remains grep-friendly and
+	# distinct from any limited run.
+	LM_EVAL_TASKS_LABEL="${LM_EVAL_TASKS//,/_}"
+	if [[ -n "${LM_EVAL_LIMIT}" ]]; then
+		LM_EVAL_LIMIT_LABEL="lim${LM_EVAL_LIMIT}"
+	else
+		LM_EVAL_LIMIT_LABEL="limfull"
+	fi
+	LM_EVAL_RESULT_LABEL="lm_eval_${LM_EVAL_TASKS_LABEL}_${LM_EVAL_LIMIT_LABEL}_fs${LM_EVAL_NUM_FEWSHOT}"
+	LM_EVAL_LOG_FILE="${RESULTS_DIR}/${LM_EVAL_RESULT_LABEL}.log"
+	# lm_eval writes per-task JSON / JSONL outputs under --output_path.
+	# Use a per-run subdirectory so multiple sweeps in one job don't
+	# clobber each other's artifacts.
+	LM_EVAL_OUTPUT_PATH="${RESULTS_DIR}/${LM_EVAL_RESULT_LABEL}"
+	mkdir -p "${LM_EVAL_OUTPUT_PATH}"
+
+	# Build --limit args conditionally. When LM_EVAL_LIMIT is empty,
+	# omit the flag entirely so lm_eval evaluates the full task split
+	# (its own default). Passing --limit "" would error.
+	LM_EVAL_LIMIT_ARGS=()
+	if [[ -n "${LM_EVAL_LIMIT}" ]]; then
+		LM_EVAL_LIMIT_ARGS=(--limit "${LM_EVAL_LIMIT}")
+	fi
+
+	echo "  Model args:        ${LM_EVAL_MODEL_ARGS}"
+	echo "  Tasks:             ${LM_EVAL_TASKS}"
+	echo "  Limit:             ${LM_EVAL_LIMIT:-(full split)}"
+	echo "  Few-shot:          ${LM_EVAL_NUM_FEWSHOT}"
+	echo "  Log file:          ${LM_EVAL_LOG_FILE}"
+	echo "  Output dir:        ${LM_EVAL_OUTPUT_PATH}"
+	echo ""
+
+	lm_eval \
+		--model vllm \
+		--model_args "${LM_EVAL_MODEL_ARGS}" \
+		--tasks "${LM_EVAL_TASKS}" \
+		${LM_EVAL_LIMIT_ARGS[@]+"${LM_EVAL_LIMIT_ARGS[@]}"} \
+		--num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+		--output_path "${LM_EVAL_OUTPUT_PATH}" \
+		2>&1 | tee "${LM_EVAL_LOG_FILE}"
+
+	echo ""
+	echo "lm-evaluation-harness accuracy sweep complete."
+	echo "  Log:               ${LM_EVAL_LOG_FILE}"
+	echo "  JSON results:      ${LM_EVAL_OUTPUT_PATH}/"
+	echo ""
+else
+	echo "[Step 7/7] Skipping lm-evaluation-harness sweep (RUN_LM_EVAL=${RUN_LM_EVAL})."
 	echo ""
 fi
 
@@ -2173,6 +2342,22 @@ ls -1 "${RESULTS_DIR}"/serving_*.json 2>/dev/null || echo "  (no serving JSON fi
 echo ""
 echo "Throughput results:"
 ls -1 "${RESULTS_DIR}"/throughput_*.json 2>/dev/null || echo "  (no throughput JSON files)"
+echo ""
+echo "lm-eval results:"
+# lm_eval writes its harness JSON output(s) under per-run subdirs
+# (created in Step 7) and its tee'd console log in
+# lm_eval_<task>_lim<N>_fs<K>.log. List both so a submitter can find
+# the structured per-task JSON and the human-readable log easily.
+if compgen -G "${RESULTS_DIR}/lm_eval_*.log" >/dev/null 2>&1; then
+	ls -1 "${RESULTS_DIR}"/lm_eval_*.log 2>/dev/null
+fi
+if compgen -G "${RESULTS_DIR}/lm_eval_*/*" >/dev/null 2>&1; then
+	# One level deep: per-run output dir contents (results JSON + jsonl).
+	ls -1d "${RESULTS_DIR}"/lm_eval_*/ 2>/dev/null
+fi
+if ! compgen -G "${RESULTS_DIR}/lm_eval_*" >/dev/null 2>&1; then
+	echo "  (no lm-eval results)"
+fi
 echo ""
 echo "Profiler traces:"
 if [[ "${PROFILE}" == "1" ]]; then
@@ -2197,5 +2382,7 @@ echo "  - Offline latency:    end-to-end latency per (batch size, input length)"
 echo "  - Online serving:     TTFT, TPOT, ITL, E2EL at p50/p90/p95/p99"
 echo "  - Offline throughput: total tokens/s per IO shape"
 echo "  - Online:  request throughput, token throughput"
+echo "  - lm-eval:            per-task accuracy / correctness (acc, acc_norm,"
+echo "                        exact_match, ...; see lm_eval_*/results_*.json)"
 echo ""
 echo "Cleanup will run automatically via EXIT trap."

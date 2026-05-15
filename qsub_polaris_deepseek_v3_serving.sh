@@ -46,6 +46,7 @@ export REQUEST_RATES_CSV="${REQUEST_RATES_CSV:-inf}"
 export RUN_LATENCY="${RUN_LATENCY:-0}"
 export RUN_SERVING="${RUN_SERVING:-1}"
 export RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
+export RUN_LM_EVAL="${RUN_LM_EVAL:-0}"
 
 # Backend selection. Default is ray (matches pre-existing behaviour so
 # submitters with no BACKEND set see no change). Set BACKEND=mp to use

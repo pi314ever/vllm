@@ -325,6 +325,24 @@ RUN_LATENCY="${RUN_LATENCY:-1}"
 RUN_SERVING="${RUN_SERVING:-1}"
 RUN_THROUGHPUT="${RUN_THROUGHPUT:-0}"
 
+# RUN_LM_EVAL is consumed by the Ray body (qsub_polaris_body.sh Step 7);
+# the mp body does NOT implement an lm-evaluation-harness step because
+# lm-eval-harness's vllm wrapper does not expose torch.distributed
+# rendezvous args (--nnodes / --node-rank / --master-addr / --master-port)
+# needed to drive the headless --headless workers used here. Any wrapper
+# that routes to BACKEND=mp must therefore have RUN_LM_EVAL unset or 0.
+# Fail closed so a stale `qsub -v BACKEND=mp -v RUN_LM_EVAL=1 ...` doesn't
+# silently drop the accuracy job.
+RUN_LM_EVAL="${RUN_LM_EVAL:-0}"
+if [[ "${RUN_LM_EVAL}" == "1" ]]; then
+	echo "ERROR: RUN_LM_EVAL=1 is not supported with BACKEND=mp."
+	echo "       lm-evaluation-harness's vllm wrapper has no torch.distributed"
+	echo "       rendezvous args, so multi-node TP via headless workers cannot"
+	echo "       be driven from inside lm_eval. Use BACKEND=ray (the default"
+	echo "       for qsub_polaris_deepseek_v3_lm_eval.sh) instead."
+	exit 1
+fi
+
 # =============================================================================
 # PROFILING CONFIG
 # =============================================================================
