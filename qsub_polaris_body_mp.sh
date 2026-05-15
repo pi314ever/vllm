@@ -1134,6 +1134,16 @@ launch_mp_workers() {
 			export CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}'
 			export VLLM_HOST_IP='${wip}'
 
+			# vLLM ZMQ IPC base dir: same job-scoped short path as the
+			# head (see SHORT vLLM RPC IPC BASE PATH block in the
+			# driver). Must exist locally on every node because
+			# shm_broadcast.MessageQueue binds an ipc:// socket via
+			# get_open_zmq_ipc_path() inside each worker process on
+			# its own host. Without this mkdir, the bind fails with
+			# 'No such file or directory' on workers.
+			export VLLM_RPC_BASE_PATH='${VLLM_RPC_BASE_PATH}'
+			mkdir -p '${VLLM_RPC_BASE_PATH}'
+
 			# Persistent compile caches (shared filesystem, must match
 			# head node so FileCacheManager's per-key flock actually
 			# serializes across all ranks in the cluster).

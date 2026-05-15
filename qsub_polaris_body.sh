@@ -1574,6 +1574,15 @@ launch_worker() {
 		export RAY_TMPDIR='${RAY_TMPDIR}'
 		mkdir -p '${RAY_TMPDIR}'
 
+		# vLLM ZMQ IPC base dir: same job-scoped short path as the head
+		# (see SHORT vLLM RPC IPC BASE PATH block in the driver). Must
+		# exist locally on every node because shm_broadcast.MessageQueue
+		# binds an ipc:// socket via get_open_zmq_ipc_path() inside each
+		# RayWorkerProc actor on its own host. Without this mkdir, the
+		# bind fails with 'No such file or directory' on workers.
+		export VLLM_RPC_BASE_PATH='${VLLM_RPC_BASE_PATH}'
+		mkdir -p '${VLLM_RPC_BASE_PATH}'
+
 		# Persistent compile caches (shared filesystem, must match head
 		# node so FileCacheManager's per-key flock actually serializes
 		# across all ranks in the cluster).
