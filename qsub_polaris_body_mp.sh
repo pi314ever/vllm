@@ -1509,7 +1509,7 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 				LATENCY_PROFILE_DIR="${PROFILE_DIR}/${RUN_LABEL}"
 				mkdir -p "${LATENCY_PROFILE_DIR}"
 				LATENCY_PROFILE_ARGS=(
-					--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${LATENCY_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":false}"
+					--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${LATENCY_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":true}"
 					--profile
 				)
 				echo "  >> Profiler traces -> ${LATENCY_PROFILE_DIR}"

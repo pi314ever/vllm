@@ -1846,7 +1846,7 @@ if [[ "${RUN_LATENCY}" == "1" ]]; then
 				LATENCY_PROFILE_DIR="${PROFILE_DIR}/latency_bs${BATCH_SIZE}_in${INPUT_LEN}_out${OUTPUT_LEN}"
 				mkdir -p "${LATENCY_PROFILE_DIR}"
 				LATENCY_PROFILE_ARGS=(
-					--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${LATENCY_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":false}"
+					--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${LATENCY_PROFILE_DIR}\",\"torch_profiler_record_shapes\":true,\"torch_profiler_with_stack\":true}"
 					--profile
 				)
 				echo "  >> Profiler traces -> ${LATENCY_PROFILE_DIR}"
