@@ -289,7 +289,31 @@ mkdir -p "${MP_WORKER_LOG_DIR}"
 SAMPLER_FLAG="${DIAG_DIR}/.sampler_run"
 
 # Server port for online serving benchmark.
-SERVE_PORT="${SERVE_PORT:-8000}"
+#
+# The default is derived per-job from PBS_SHORT_JOBID rather than
+# hard-coded to 8000, to sidestep SO_REUSEPORT collisions with stale
+# listeners left over from prior jobs that happened to land on the
+# same Polaris head node. (See vllm/entrypoints/openai/api_server.py
+# create_server_socket(): the API-server socket has both SO_REUSEADDR
+# and SO_REUSEPORT, so a leftover process from a previous run can
+# silently shadow our listener and absorb /health traffic, while the
+# pre-flight ss check below only catches sockets that have already
+# called listen().) The derivation is deterministic so an operator
+# can predict the port from the job id when SSH'ing onto the head
+# node mid-run; the RANDOM fallback covers the "manual" case where
+# the body is sourced outside PBS.
+#
+# Range 30000-39999 sits below the top of the typical Linux ephemeral
+# range (32768-60999); the kernel only auto-assigns a specific
+# ephemeral port if free at bind time, and vLLM's SO_REUSEADDR makes
+# any rare race benign in practice. Override at submission with
+# `qsub -v SERVE_PORT=<N>` if you need a fixed port.
+if [[ "${PBS_SHORT_JOBID}" =~ ^[0-9]+$ ]]; then
+	SERVE_PORT="${SERVE_PORT:-$((30000 + (PBS_SHORT_JOBID % 10000)))}"
+else
+	SERVE_PORT="${SERVE_PORT:-$((30000 + RANDOM % 10000))}"
+fi
+echo "Server port: ${SERVE_PORT} (derived from PBS_SHORT_JOBID=${PBS_SHORT_JOBID})"
 
 # Max model length. Optional; empty (default) omits --max-model-len so vLLM
 # falls back to the model config's max_position_embeddings. Set to an int
@@ -1708,27 +1732,64 @@ if [[ "${RUN_SERVING}" == "1" ]]; then
 	ELAPSED=0
 	SERVER_POLL_INTERVAL=10
 
+	# Per-iteration port-state diagnostics. The pre-flight ss check
+	# above only sees a single instant; if /health stays unreachable
+	# while the server appears alive, we want a self-contained record
+	# of who, if anyone, is bound to ${SERVE_PORT} on this host and
+	# what curl is actually getting back. Snapshots fire at: post-fork
+	# (once), on-success, on-server-death, on-timeout, and every 30s
+	# while the poll is stuck waiting for /health. Both `ss` and
+	# `lsof` are invoked with `|| true` so missing tools degrade to a
+	# noisy log line rather than aborting the job.
+	PORT_DIAG_LOG="${DIAG_DIR}/serve_port_${SERVE_PORT}_poll.log"
+	LAST_PORT_SNAPSHOT=0
+	CURL_EXIT="NA"
+	snapshot_port_state() {
+		local label="$1"
+		{
+			echo "=== $(date -Iseconds) ${label} elapsed=${ELAPSED}s curl_exit=${CURL_EXIT} ==="
+			echo "-- ss -tnap sport=:${SERVE_PORT} --"
+			ss -tnap "sport = :${SERVE_PORT}" 2>&1 || true
+			echo "-- lsof -nP -iTCP:${SERVE_PORT} --"
+			lsof -nP -iTCP:"${SERVE_PORT}" 2>&1 || true
+			echo
+		} >>"${PORT_DIAG_LOG}"
+	}
+
+	snapshot_port_state "00_post_fork"
+
 	while true; do
 		if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
 			echo "ERROR: vLLM server process died unexpectedly."
+			snapshot_port_state "fatal_server_died"
 			tail -n 100 "${RESULTS_DIR}/server.log" 2>/dev/null || true
 			wait "${SERVER_PID}" || true
 			exit 1
 		fi
 
 		if curl -fsS --max-time 5 "${BASE_URL}/health" >/dev/null 2>&1; then
+			CURL_EXIT=0
+			snapshot_port_state "ready"
 			echo "Server /health passed."
 			break
+		else
+			CURL_EXIT=$?
 		fi
 
 		ELAPSED=$((ELAPSED + SERVER_POLL_INTERVAL))
 		if [[ "${ELAPSED}" -ge "${MAX_WAIT}" ]]; then
-			echo "ERROR: Server /health not 200 after ${MAX_WAIT}s."
+			echo "ERROR: Server /health not 200 after ${MAX_WAIT}s (last curl exit=${CURL_EXIT})."
+			snapshot_port_state "fatal_timeout"
 			tail -n 100 "${RESULTS_DIR}/server.log" 2>/dev/null || true
 			exit 1
 		fi
 
-		echo "  Not ready yet... retrying in ${SERVER_POLL_INTERVAL}s (${ELAPSED}s elapsed)"
+		if (( ELAPSED - LAST_PORT_SNAPSHOT >= 30 )); then
+			snapshot_port_state "polling"
+			LAST_PORT_SNAPSHOT=${ELAPSED}
+		fi
+
+		echo "  Not ready yet... retrying in ${SERVER_POLL_INTERVAL}s (${ELAPSED}s elapsed, last curl exit=${CURL_EXIT})"
 		sleep "${SERVER_POLL_INTERVAL}"
 	done
 
