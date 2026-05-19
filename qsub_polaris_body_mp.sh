@@ -1691,19 +1691,127 @@ if [[ "${RUN_SERVING}" == "1" ]]; then
 		exit 1
 	fi
 
-	# Start the vLLM server in the background on the head.
-	# Note: --model is already in MP_COMMON_ENGINE_ARGS, so do NOT pass
+	# Start the vLLM server in the background via mpiexec on
+	# HEAD_HOST. Routing through mpiexec instead of a bare `&` bash
+	# fork mirrors the launch pattern already used for the headless
+	# workers (launch_mp_workers above) and every other long-running
+	# vLLM workload in this script. Concretely this gives us:
+	#   1. Uniform process-group teardown. SIGTERM to the mpiexec
+	#      parent (SERVER_PID below) is propagated by palsd to the
+	#      bash -c subshell and then to vllm via the `exec` below,
+	#      so cleanup() / Step 5's own teardown can kill the whole
+	#      vllm process tree (engine driver, MultiprocExecutor
+	#      driver-side workers, uvicorn) reliably. A bare
+	#      `vllm serve ... &` puts the whole tree in this script's
+	#      cgroup / pgid, where vllm's children can outlive the kill
+	#      if vllm is mid-exec / mid-fork.
+	#   2. Cgroup hygiene: palsd places each mpiexec session in its
+	#      own pids cgroup subtree, freeing thread-budget headroom
+	#      inside the driver's own cgroup.
+	#   3. Symmetry with launch_mp_workers; one less special-cased
+	#      code path for diagnostics / cleanup to reason about.
+	#
+	# --model is already in MP_COMMON_ENGINE_ARGS, so do NOT pass
 	# it as a positional arg again (duplicate-arg error).
-	vllm serve \
-		"${MP_COMMON_ENGINE_ARGS[@]}" \
-		"${MP_HEAD_DIST_ARGS[@]}" \
-		--host 0.0.0.0 \
-		--port "${SERVE_PORT}" \
-		${SERVE_PROFILE_ARGS[@]+"${SERVE_PROFILE_ARGS[@]}"} \
-		>"${RESULTS_DIR}/server.log" 2>&1 &
+	#
+	# Engine args are pre-quoted with printf %q so they survive the
+	# outer->inner bash-c expansion intact (one round of word-
+	# splitting inside the remote bash). Mirrors the
+	# worker_args_str pattern used by launch_mp_workers.
+	SERVE_ARGS=(
+		"${MP_COMMON_ENGINE_ARGS[@]}"
+		"${MP_HEAD_DIST_ARGS[@]}"
+		--host 0.0.0.0
+		--port "${SERVE_PORT}"
+		${SERVE_PROFILE_ARGS[@]+"${SERVE_PROFILE_ARGS[@]}"}
+	)
+	SERVE_ARGS_STR="$(printf '%q ' "${SERVE_ARGS[@]}")"
+
+	# Re-export every env knob the head shell has set, so the
+	# mpiexec-spawned bash on HEAD_HOST sees the same VllmConfig /
+	# threading / cache / NCCL shape as the headless workers (kept
+	# in lockstep with launch_mp_workers; any env var added there
+	# must be added here too or MultiprocExecutor's worker-side
+	# VllmConfig consistency check will reject the rendezvous).
+	mpiexec -n 1 --ppn 1 --hosts "${HEAD_HOST}" -- bash -c "
+		set -euo pipefail
+
+		export CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}'
+		export VLLM_HOST_IP='${HEAD_IP}'
+
+		# vLLM ZMQ IPC base dir (see SHORT vLLM RPC IPC BASE PATH
+		# block in the driver). Must exist locally so engine sockets
+		# can bind.
+		export VLLM_RPC_BASE_PATH='${VLLM_RPC_BASE_PATH}'
+		mkdir -p '${VLLM_RPC_BASE_PATH}'
+
+		# Persistent compile caches (must match headless workers so
+		# FileCacheManager's per-key flock serializes across all
+		# ranks).
+		export TRITON_CACHE_DIR='${TRITON_CACHE_DIR}'
+		export TORCHINDUCTOR_CACHE_DIR='${TORCHINDUCTOR_CACHE_DIR}'
+		export VLLM_CACHE_ROOT='${VLLM_CACHE_ROOT}'
+		export TRITON_CACHE_MANAGER='${TRITON_CACHE_MANAGER}'
+
+		# Thread limits.
+		export OMP_NUM_THREADS='${OMP_NUM_THREADS}'
+		export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS}'
+		export MKL_NUM_THREADS='${MKL_NUM_THREADS}'
+		export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS}'
+		export VECLIB_MAXIMUM_THREADS='${VECLIB_MAXIMUM_THREADS}'
+		export RAYON_NUM_THREADS='${RAYON_NUM_THREADS}'
+		export TORCH_NUM_THREADS='${TORCH_NUM_THREADS}'
+
+		# Subprocess fan-out caps.
+		export TORCHINDUCTOR_COMPILE_THREADS='${TORCHINDUCTOR_COMPILE_THREADS}'
+		export XALT_EXECUTABLE_TRACKING='${XALT_EXECUTABLE_TRACKING}'
+
+		# Additional thread-count caps.
+		export NCCL_SOCKET_NTHREADS='${NCCL_SOCKET_NTHREADS}'
+		export NCCL_NSOCKS_PERTHREAD='${NCCL_NSOCKS_PERTHREAD}'
+		export TOKENIZERS_PARALLELISM='${TOKENIZERS_PARALLELISM}'
+		export VLLM_NO_USAGE_STATS='${VLLM_NO_USAGE_STATS}'
+		export DO_NOT_TRACK='${DO_NOT_TRACK}'
+
+		# PyTorch NCCL per-PG thread minimization.
+		export TORCH_NCCL_ENABLE_MONITORING='${TORCH_NCCL_ENABLE_MONITORING}'
+		export TORCH_NCCL_TRACE_BUFFER_SIZE='${TORCH_NCCL_TRACE_BUFFER_SIZE}'
+		export TORCH_NCCL_DUMP_ON_TIMEOUT='${TORCH_NCCL_DUMP_ON_TIMEOUT}'
+
+		# Cgroup resolution for serve-side diagnostics.
+		export PBS_SHORT_JOBID='${PBS_SHORT_JOBID}'
+
+		# NCCL/Gloo socket interface (matches workers; also used by
+		# torch.distributed for the rendezvous TCPStore on
+		# MP_MASTER_PORT).
+		export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
+		export GLOO_SOCKET_IFNAME='${RAY_IFNAME}'
+		export NCCL_DEBUG='${NCCL_DEBUG}'
+
+		# Optional bumped RPC timeout (only set under PROFILE=1).
+		if [[ -n '${VLLM_RPC_TIMEOUT:-}' ]]; then
+			export VLLM_RPC_TIMEOUT='${VLLM_RPC_TIMEOUT:-}'
+		fi
+
+		# Proxy settings (so vllm serve's HF / metrics fetches go
+		# through ALCF's HTTP proxy, matching the head shell).
+		export http_proxy='${http_proxy}'
+		export https_proxy='${https_proxy}'
+		export ftp_proxy='${ftp_proxy}'
+
+		# Load CUDA runtime libraries.
+		module load cuda/12.9
+
+		# Activate the venv so vllm is on PATH.
+		source '${VENV_DIR}/bin/activate'
+
+		# exec so signals from mpiexec's process manager flow to
+		# vllm directly (no interposed bash absorbing SIGTERM).
+		exec vllm serve ${SERVE_ARGS_STR}
+	" >"${RESULTS_DIR}/server.log" 2>&1 &
 
 	SERVER_PID=$!
-	echo "vLLM server starting in background (PID ${SERVER_PID})..."
+	echo "vLLM server starting in background via mpiexec on ${HEAD_HOST} (mpiexec PID ${SERVER_PID})..."
 
 	# Wait for server readiness via a two-stage probe:
 	#   Stage 1: poll GET /health until 200. /health is gated by

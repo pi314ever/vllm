@@ -2033,25 +2033,147 @@ if ss -ltn "sport = :${SERVE_PORT}" 2>/dev/null | grep -q LISTEN; then
 	exit 1
 fi
 
-# Start the vLLM server in the background.
-# Use a process group so we can cleanly kill the server and its children.
-vllm serve "${MODEL}" \
-	${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"} \
-	--dtype "${DTYPE}" \
-	--tensor-parallel-size "${TP_SIZE}" \
-	--pipeline-parallel-size "${PP_SIZE}" \
-	--enable-expert-parallel \
-	--distributed-executor-backend ray \
-	${MAX_MODEL_LEN_ARGS[@]+"${MAX_MODEL_LEN_ARGS[@]}"} \
-	--trust-remote-code \
-	--enforce-eager \
-	--host 0.0.0.0 \
-	--port "${SERVE_PORT}" \
-	${SERVE_PROFILE_ARGS[@]+"${SERVE_PROFILE_ARGS[@]}"} \
-	>"${RESULTS_DIR}/server.log" 2>&1 &
+# Start the vLLM server in the background via mpiexec on HEAD_HOST.
+#
+# Routing through mpiexec instead of a bare `&` bash fork mirrors the
+# launch pattern already used by every other long-running vLLM
+# workload in this script (worker Ray join via launch_worker, all-
+# nodes diagnostic fan-outs, the background sampler). Concretely this
+# gives us:
+#   1. Uniform process-group teardown. SIGTERM to the mpiexec parent
+#      (SERVER_PID below) is propagated by palsd to the bash -c
+#      subshell and then to vllm via the `exec` below, so the cleanup
+#      trap's `kill ${SERVER_PID}` reliably tears down the entire
+#      vllm process tree (engine driver, Ray client actors, uvicorn
+#      workers). A bare `vllm serve ... &` puts the whole tree in
+#      this script's own cgroup / pgid, where vllm's children can
+#      outlive the kill if vllm is mid-exec / mid-fork.
+#   2. Cgroup hygiene: palsd places each mpiexec session in its own
+#      pids cgroup subtree, freeing thread-budget headroom inside
+#      the driver's own cgroup that the inline vllm serve process
+#      tree was previously consuming.
+#   3. Symmetry with the worker launches above; one less special-
+#      cased code path for diagnostics / cleanup to reason about.
+#
+# Engine args are pre-quoted with printf %q so they survive the
+# outer->inner bash-c expansion intact (one round of word-splitting
+# inside the remote bash). Mirrors the worker_args_str pattern in
+# qsub_polaris_body_mp.sh's launch_mp_workers.
+SERVE_ARGS=(
+	"${MODEL}"
+	${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}
+	--dtype "${DTYPE}"
+	--tensor-parallel-size "${TP_SIZE}"
+	--pipeline-parallel-size "${PP_SIZE}"
+	--enable-expert-parallel
+	--distributed-executor-backend ray
+	${MAX_MODEL_LEN_ARGS[@]+"${MAX_MODEL_LEN_ARGS[@]}"}
+	--trust-remote-code
+	--enforce-eager
+	--host 0.0.0.0
+	--port "${SERVE_PORT}"
+	${SERVE_PROFILE_ARGS[@]+"${SERVE_PROFILE_ARGS[@]}"}
+)
+SERVE_ARGS_STR="$(printf '%q ' "${SERVE_ARGS[@]}")"
+
+# Re-export every env knob the head shell has set, so the mpiexec-
+# spawned bash on HEAD_HOST sees the same VllmConfig / threading /
+# cache / NCCL shape as the Ray workers (kept in lockstep with
+# launch_worker above; any env var added there must be added here
+# too or the head engine's VllmConfig will diverge from the Ray
+# workers' and the cluster will fail engine init).
+mpiexec -n 1 --ppn 1 --hosts "${HEAD_HOST}" -- bash -c "
+	set -euo pipefail
+
+	export CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}'
+	export VLLM_HOST_IP='${HEAD_IP}'
+
+	# Ray attach: vllm serve must talk to the existing Ray cluster
+	# (Steps 1-3) rather than start its own local instance. Without
+	# RAY_ADDRESS, vllm/v1/executor/ray_utils.py:initialize_ray_cluster
+	# falls through to ray.init(address=None) and only sees this
+	# node's GPUs.
+	export RAY_ADDRESS='${RAY_ADDRESS}'
+	export RAY_USAGE_STATS_ENABLED=0
+	export RAY_TMPDIR='${RAY_TMPDIR}'
+	mkdir -p '${RAY_TMPDIR}'
+
+	# vLLM ZMQ IPC base dir (see SHORT vLLM RPC IPC BASE PATH block
+	# in the driver). Must exist locally so engine sockets can bind.
+	export VLLM_RPC_BASE_PATH='${VLLM_RPC_BASE_PATH}'
+	mkdir -p '${VLLM_RPC_BASE_PATH}'
+
+	# Persistent compile caches (must match Ray workers so
+	# FileCacheManager's per-key flock serializes across all ranks).
+	export TRITON_CACHE_DIR='${TRITON_CACHE_DIR}'
+	export TORCHINDUCTOR_CACHE_DIR='${TORCHINDUCTOR_CACHE_DIR}'
+	export VLLM_CACHE_ROOT='${VLLM_CACHE_ROOT}'
+	export TRITON_CACHE_MANAGER='${TRITON_CACHE_MANAGER}'
+
+	# Ray executor backend selector.
+	export VLLM_USE_RAY_V2_EXECUTOR_BACKEND='${VLLM_USE_RAY_V2_EXECUTOR_BACKEND}'
+
+	# Thread limits.
+	export OMP_NUM_THREADS='${OMP_NUM_THREADS}'
+	export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS}'
+	export MKL_NUM_THREADS='${MKL_NUM_THREADS}'
+	export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS}'
+	export VECLIB_MAXIMUM_THREADS='${VECLIB_MAXIMUM_THREADS}'
+	export RAYON_NUM_THREADS='${RAYON_NUM_THREADS}'
+	export TORCH_NUM_THREADS='${TORCH_NUM_THREADS}'
+
+	# Subprocess fan-out caps.
+	export TORCHINDUCTOR_COMPILE_THREADS='${TORCHINDUCTOR_COMPILE_THREADS}'
+	export XALT_EXECUTABLE_TRACKING='${XALT_EXECUTABLE_TRACKING}'
+
+	# Additional thread-count caps.
+	export NCCL_SOCKET_NTHREADS='${NCCL_SOCKET_NTHREADS}'
+	export NCCL_NSOCKS_PERTHREAD='${NCCL_NSOCKS_PERTHREAD}'
+	export TOKENIZERS_PARALLELISM='${TOKENIZERS_PARALLELISM}'
+	export RAY_memory_monitor_refresh_ms='${RAY_memory_monitor_refresh_ms}'
+	export VLLM_NO_USAGE_STATS='${VLLM_NO_USAGE_STATS}'
+	export DO_NOT_TRACK='${DO_NOT_TRACK}'
+	export RAY_num_workers_soft_limit='${RAY_num_workers_soft_limit}'
+
+	# PyTorch NCCL per-PG thread minimization.
+	export TORCH_NCCL_ENABLE_MONITORING='${TORCH_NCCL_ENABLE_MONITORING}'
+	export TORCH_NCCL_TRACE_BUFFER_SIZE='${TORCH_NCCL_TRACE_BUFFER_SIZE}'
+	export TORCH_NCCL_DUMP_ON_TIMEOUT='${TORCH_NCCL_DUMP_ON_TIMEOUT}'
+
+	# Cgroup resolution for serve-side diagnostics.
+	export PBS_SHORT_JOBID='${PBS_SHORT_JOBID}'
+
+	# NCCL/Gloo socket interface (matches workers).
+	export NCCL_SOCKET_IFNAME='${RAY_IFNAME}'
+	export GLOO_SOCKET_IFNAME='${RAY_IFNAME}'
+	export NCCL_DEBUG='${NCCL_DEBUG}'
+
+	# Optional bumped RPC timeout (only set under PROFILE=1; the
+	# trailing :- guards the case where it is unset in the outer
+	# shell, which would otherwise expand to an empty export).
+	if [[ -n '${VLLM_RPC_TIMEOUT:-}' ]]; then
+		export VLLM_RPC_TIMEOUT='${VLLM_RPC_TIMEOUT:-}'
+	fi
+
+	# Proxy settings (so vllm serve's HF / metrics fetches go
+	# through ALCF's HTTP proxy, matching the head shell).
+	export http_proxy='${http_proxy}'
+	export https_proxy='${https_proxy}'
+	export ftp_proxy='${ftp_proxy}'
+
+	# Load CUDA runtime libraries.
+	module load cuda/12.9
+
+	# Activate the venv so vllm is on PATH.
+	source '${VENV_DIR}/bin/activate'
+
+	# exec so signals from mpiexec's process manager flow to vllm
+	# directly (no interposed bash absorbing SIGTERM).
+	exec vllm serve ${SERVE_ARGS_STR}
+" >"${RESULTS_DIR}/server.log" 2>&1 &
 
 SERVER_PID=$!
-echo "vLLM server starting in background (PID ${SERVER_PID})..."
+echo "vLLM server starting in background via mpiexec on ${HEAD_HOST} (mpiexec PID ${SERVER_PID})..."
 
 # Wait for server readiness via a two-stage probe:
 #   Stage 1: poll GET /health until 200. /health is gated by
